@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: exports RtcCallOutcome.
 
 use std::{
     ops::{Deref, DerefMut},
@@ -46,7 +48,8 @@ pub use self::{
         AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
         InReplyToDetails, LiveLocationState, MemberProfileChange, MembershipChange, Message,
         MsgLikeContent, MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState,
-        RoomMembershipChange, RoomPinnedEventsChange, Sticker, ThreadSummary, TimelineItemContent,
+        RoomMembershipChange, RoomPinnedEventsChange, RtcCallOutcome, Sticker, ThreadSummary,
+        TimelineItemContent,
     },
     local::{EventSendState, MediaUploadProgress},
 };

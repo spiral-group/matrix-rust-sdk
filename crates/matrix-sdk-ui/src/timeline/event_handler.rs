@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: call membership changes are recorded,
+// and every call notification's outcome is recomputed from them.
 
 use std::{borrow::Cow, sync::Arc};
 
@@ -23,7 +26,7 @@ use matrix_sdk::{
 use matrix_sdk_base::crypto::types::events::UtdCause;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId,
-    TransactionId,
+    TransactionId, UserId,
     events::{
         AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
         AnySyncTimelineEvent, MessageLikeEventContent, MessageLikeEventType,
@@ -47,20 +50,23 @@ use super::{
     LiveLocationState, MsgLikeContent, MsgLikeKind, OtherState, ReactionStatus, Sticker,
     ThreadSummary, TimelineDetails, TimelineItem, TimelineItemContent,
     controller::{
-        Aggregation, AggregationKind, ObservableItemsTransaction, PendingEditKind,
-        TimelineMetadata, TimelineStateTransaction, find_item_and_apply_aggregation,
+        Aggregation, AggregationKind, CallMemberChange, ObservableItemsTransaction,
+        PendingEditKind, TimelineMetadata, TimelineStateTransaction,
+        find_item_and_apply_aggregation, rtc_call_outcomes, rtc_notification_ringing_at,
     },
     date_dividers::DateDividerAdjuster,
     event_item::{
         AnyOtherStateEventContentChange, EventSendState, EventTimelineItemKind,
         LocalEventTimelineItem, PollState, Profile, RemoteEventOrigin, RemoteEventTimelineItem,
-        TimelineEventItemId,
+        RtcCallOutcome, TimelineEventItemId,
     },
     traits::RoomDataProvider,
 };
 use crate::{
     timeline::{
-        TimelineUniqueId, algorithms::rfind_event_item, controller::aggregations::PendingEdit,
+        TimelineUniqueId,
+        algorithms::{rfind_event_by_id, rfind_event_item},
+        controller::aggregations::PendingEdit,
         event_item::OtherMessageLike,
     },
     unable_to_decrypt_hook::UtdHookManager,
@@ -213,6 +219,20 @@ pub(super) enum TimelineAction {
         related_event: OwnedEventId,
         /// What kind of aggregation are we handling here?
         kind: HandleAggregationKind,
+    },
+
+    /// A call membership change (Spiral): recorded in the timeline
+    /// metadata, from which every `m.rtc.notification`'s outcome is
+    /// recomputed. There is no `relates_to` on membership state events, so
+    /// this cannot ride the aggregation machinery.
+    RecordCallMemberChange {
+        /// The member whose call membership changed, from the typed state
+        /// key.
+        member_user_id: OwnedUserId,
+        /// The event's state key: one membership per user and device.
+        member_state_key: String,
+        /// Whether the event carries a membership (joined) or none (left).
+        is_join: bool,
     },
 }
 
@@ -389,6 +409,32 @@ impl TimelineAction {
                         ))]
                     }
                 },
+                AnySyncStateEvent::CallMember(ev) => {
+                    // A call membership change feeds the outcome of the
+                    // `m.rtc.notification` whose call it belongs to. A join
+                    // is read from the content as sent: whether it has
+                    // expired by now says nothing about the call it was in.
+                    let is_join = match &ev {
+                        SyncStateEvent::Original(original) => {
+                            !original.content.memberships().is_empty()
+                        }
+                        SyncStateEvent::Redacted(_) => false,
+                    };
+                    let member_user_id = ev.state_key().user_id().to_owned();
+                    let member_state_key = ev.state_key().as_ref().to_owned();
+                    // Re-wrap so the timeline item is built exactly the way
+                    // the generic state arm below builds it.
+                    let ev = AnySyncStateEvent::CallMember(ev);
+                    vec![
+                        Self::add_item(TimelineItemContent::OtherState(OtherState {
+                            state_key: ev.state_key().to_owned(),
+                            content: AnyOtherStateEventContentChange::with_event_content(
+                                ev.content_change(),
+                            ),
+                        })),
+                        Self::RecordCallMemberChange { member_user_id, member_state_key, is_join },
+                    ]
+                }
                 ev => vec![Self::add_item(TimelineItemContent::OtherState(OtherState {
                     state_key: ev.state_key().to_owned(),
                     content: AnyOtherStateEventContentChange::with_event_content(
@@ -456,6 +502,11 @@ impl TimelineAction {
                     call_intent: c.call_intent,
                     declined_by: Vec::new(),
                     active_call_info: None,
+                    notification_type: Some(c.notification_type),
+                    lifetime_ms: u64::try_from(c.lifetime.as_millis()).ok(),
+                    // Filled in by `recompute_rtc_outcomes` once the item is
+                    // in the timeline.
+                    outcome: RtcCallOutcome::default(),
                 })
             }
 
@@ -671,6 +722,27 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
             }
             TimelineAction::HandleAggregation { related_event, kind } => {
                 self.handle_aggregation_action(related_event, kind);
+                false
+            }
+            TimelineAction::RecordCallMemberChange {
+                member_user_id,
+                member_state_key,
+                is_join,
+            } => {
+                if let Flow::Remote { event_id, .. } = &self.ctx.flow {
+                    let member_user_id_for_adoption = member_user_id.clone();
+                    self.meta.record_call_member_change(CallMemberChange {
+                        event_id: event_id.clone(),
+                        state_key: member_state_key,
+                        user_id: member_user_id,
+                        is_join,
+                        ts: self.ctx.timestamp,
+                    });
+                    self.recompute_rtc_outcomes();
+                    if is_join {
+                        self.adopt_rtc_notification_for_activation(&member_user_id_for_adoption);
+                    }
+                }
                 false
             }
         }
@@ -1242,6 +1314,7 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
         // Handle RTC notification active members population and cleanup
         if is_rtc_notification {
+            self.recompute_rtc_outcomes();
             self.apply_active_call_to_last_rtc_notification();
         }
 
@@ -1251,78 +1324,127 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
         }
     }
 
+    /// Spiral: recomputes every `m.rtc.notification` item's outcome from the
+    /// call membership changes seen so far, replacing the items whose
+    /// outcome changed. Linear in the items; it runs only when a
+    /// notification or a call membership event is handled.
+    fn recompute_rtc_outcomes(&mut self) {
+        let outcomes =
+            rtc_call_outcomes(self.items, &self.meta.call_member_changes, &self.meta.own_user_id);
+        for (idx, outcome) in outcomes {
+            let Some(event) = self.items[idx].as_event() else { continue };
+            let mut content = event.content().clone();
+            let TimelineItemContent::RtcNotification { outcome: current, .. } = &mut content else {
+                continue;
+            };
+            if *current == outcome {
+                continue;
+            }
+            *current = outcome;
+            let new_item = event.with_content(content);
+            let internal_id = self.items[idx].internal_id.clone();
+            self.items.replace(idx, TimelineItem::new(new_item, internal_id));
+        }
+    }
+
+    /// Spiral (F7): the room info carried the call before the timeline
+    /// handled this membership, so the call update found nothing to adopt.
+    /// If this activation belongs to the newest notification's ring, that
+    /// tile takes the call now.
+    fn adopt_rtc_notification_for_activation(&mut self, member: &UserId) {
+        if self.meta.active_rtc_notification_event_id.is_some() {
+            return;
+        }
+        let Some(active_call) = self.meta.active_call.clone() else {
+            return;
+        };
+        // A join by someone not in the running call is from another call.
+        if !active_call.active_members.contains(member) {
+            return;
+        }
+        let Some(event_id) = rtc_notification_ringing_at(self.items, self.ctx.timestamp) else {
+            return;
+        };
+        let Some((idx, item)) = rfind_event_by_id(self.items, &event_id) else {
+            return;
+        };
+        let mut content = item.content().clone();
+        let TimelineItemContent::RtcNotification { active_call_info, .. } = &mut content else {
+            return;
+        };
+        *active_call_info = Some(active_call.with_start_time(Some(item.timestamp())));
+        let new_content = content;
+        let new_item =
+            TimelineItem::new(item.inner.with_content(new_content), item.internal_id.clone());
+        self.items.replace(idx, new_item);
+        self.meta.active_rtc_notification_event_id = Some(event_id);
+    }
+
     /// Ensures that the last RtcNotification in the timeline has the current
     /// active call info, and cleans up any previous notification that had
     /// active members.
     fn apply_active_call_to_last_rtc_notification(&mut self) {
-        let last_notification = rfind_event_item(self.items, |it| {
+        let Some((idx, internal_id, last_notification)) = rfind_event_item(self.items, |it| {
             matches!(it.content(), TimelineItemContent::RtcNotification { .. })
         })
-        .map(|(a, b)| (a, b.internal_id.clone(), b.clone()));
+        .map(|(a, b)| (a, b.internal_id.clone(), b.clone())) else {
+            return;
+        };
+        let TimelineItemContent::RtcNotification { active_call_info: last_call, .. } =
+            last_notification.content()
+        else {
+            return;
+        };
 
-        if let Some((idx, internal_id, last_notification)) = last_notification {
-            // Is this the same as previously?
-            if let Some(prev_event_id) = &self.meta.active_rtc_notification_event_id {
-                if Some(prev_event_id.as_ref()) == last_notification.event_id() {
-                    // then no changes, the newest rtc_notification event have not change
+        if let Some(prev_event_id) = self.meta.active_rtc_notification_event_id.clone() {
+            if Some(prev_event_id.as_ref()) == last_notification.event_id() {
+                // The newest notification has not changed. Spiral: unless it
+                // was rebuilt in place (`UpdateAt`, a late decryption) and
+                // lost the call it carried.
+                if last_call.is_some() || self.meta.active_call.is_none() {
                     return;
                 }
-
-                // They are different, clean the old event
-                // Find the previous notification item and clear its active_members
-                if let Some((idx, prev_item)) =
-                    rfind_event_item(self.items, |it: &EventTimelineItem| {
-                        it.event_id() == Some(prev_event_id)
-                    })
-                    && let TimelineItemContent::RtcNotification {
-                        call_intent,
-                        declined_by,
-                        active_call_info,
-                    } = prev_item.content()
+            } else if let Some((prev_idx, prev_item)) =
+                rfind_event_item(self.items, |it: &EventTimelineItem| {
+                    it.event_id() == Some(&prev_event_id)
+                })
+            {
+                // They are different: clear the old notification's call, if
+                // it still has one.
+                let mut content = prev_item.content().clone();
+                if let TimelineItemContent::RtcNotification { active_call_info, .. } = &mut content
+                    && active_call_info.is_some()
                 {
-                    // Only clear if it has active members (not already empty)
-                    if active_call_info.is_some() {
-                        let new_content = TimelineItemContent::RtcNotification {
-                            call_intent: call_intent.clone(),
-                            declined_by: declined_by.clone(),
-                            active_call_info: None,
-                        };
-                        let new_event_item = prev_item.inner.with_content(new_content);
-                        let new_timeline_item =
-                            TimelineItem::new(new_event_item, prev_item.internal_id.clone());
-                        self.items.replace(idx, new_timeline_item);
-                    }
+                    *active_call_info = None;
+                    let new_item = TimelineItem::new(
+                        prev_item.inner.with_content(content),
+                        prev_item.internal_id.clone(),
+                    );
+                    self.items.replace(prev_idx, new_item);
                 }
             }
+        }
 
-            // Update the new last notification if needed
-            if self.meta.active_call.is_some() {
-                let TimelineItemContent::RtcNotification { call_intent, declined_by, .. } =
-                    last_notification.content()
-                else {
-                    // Nothing to update
-                    return;
-                };
+        // Update the new last notification if needed
+        if let Some(active_call) = self.meta.active_call.clone() {
+            let mut content = last_notification.content().clone();
+            let TimelineItemContent::RtcNotification { active_call_info, .. } = &mut content else {
+                return;
+            };
+            // The notification's OWN timestamp, as the controller path reads
+            // it — `ctx.timestamp` is the event being handled, which for a
+            // back-paginated older notification is not the one the call
+            // attaches to.
+            *active_call_info =
+                Some(active_call.with_start_time(Some(last_notification.timestamp())));
 
-                let new_content = TimelineItemContent::RtcNotification {
-                    call_intent: call_intent.clone(),
-                    declined_by: declined_by.clone(),
-                    active_call_info: self
-                        .meta
-                        .active_call
-                        .clone()
-                        .map(|c| c.with_start_time(Some(self.ctx.timestamp))),
-                };
+            let updated_event_item = last_notification.with_content(content);
+            self.items.replace(idx, TimelineItem::new(updated_event_item, internal_id));
 
-                let updated_event_item = last_notification.with_content(new_content);
-                let new_timeline_item = TimelineItem::new(updated_event_item, internal_id);
-                self.items.replace(idx, new_timeline_item);
-
-                // Update the active_rtc_notification_event_id so that this event gets any new
-                // updates of call membership
-                self.meta.active_rtc_notification_event_id =
-                    last_notification.event_id().map(ToOwned::to_owned);
-            }
+            // Update the active_rtc_notification_event_id so that this event gets any new
+            // updates of call membership
+            self.meta.active_rtc_notification_event_id =
+                last_notification.event_id().map(ToOwned::to_owned);
         }
     }
 

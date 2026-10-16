@@ -1,3 +1,5 @@
+# Modified by the Spiral authors, 2026: the experimental-matrixrtc feature
+# (native MatrixRTC sessions).
 [package]
 authors = ["Damir Jelić <poljar@termina.org.uk>"]
 description = "A high level Matrix client-server library."
@@ -84,6 +86,10 @@ federation-api = ["ruma/federation-api-c"]
 uniffi = ["dep:uniffi", "matrix-sdk-base/uniffi", "dep:matrix-sdk-ffi-macros"]
 
 experimental-widgets = ["dep:uuid", "experimental-send-custom-to-device"]
+
+# Native MatrixRTC sessions: membership lifecycle, SFU authorization and
+# media-key distribution, without an embedded web application.
+experimental-matrixrtc = ["e2e-encryption", "experimental-send-custom-to-device", "dep:rand"]
 
 docsrs = ["e2e-encryption", "sqlite", "indexeddb", "sso-login", "qrcode", "federation-api"]
 

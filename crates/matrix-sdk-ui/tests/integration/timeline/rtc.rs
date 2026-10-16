@@ -1,3 +1,6 @@
+// Modified by the Spiral authors, 2026: tests that a rebuilt timeline keeps the
+// running call (from upstream PR #6829) and of call outcomes.
+
 use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk::{assert_let_timeout, test_utils::mocks::MatrixMockServer};
@@ -288,6 +291,102 @@ async fn test_active_call_info() {
     assert!(active_members.contains(&ALICE.to_owned()));
 }
 
+// Leaving the room and coming back to it rebuilds a brand new `Timeline` out of
+// the event cache. The pre-existing `rtc.notification` item must still be
+// decorated with the active call info, and the call start timestamp must be the
+// one of the notification event, not something else.
+#[async_test]
+async fn test_active_call_info_is_restored_when_the_timeline_is_rebuilt() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let notification_event_id = event_id!("$notify");
+    let notification_timestamp = MilliSecondsSinceUnixEpoch::now();
+
+    let f = EventFactory::new();
+
+    {
+        // Enter the room a first time, and observe an active call.
+        let timeline = room.timeline().await.unwrap();
+        let (_, mut timeline_stream) = timeline.subscribe().await;
+
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id)
+                    .add_state_event(
+                        f.call_membership_state(BOB.to_owned(), "BOB_DEVICE".to_owned())
+                            .set_livekit_focus(
+                                room_id.into(),
+                                "https://livekit.example.org".to_owned(),
+                            )
+                            .event_id(event_id!("$bob-joined")),
+                    )
+                    .add_timeline_event(
+                        f.rtc_notification(NotificationType::Ring)
+                            .sender(&BOB)
+                            .server_ts(notification_timestamp)
+                            .event_id(notification_event_id),
+                    ),
+            )
+            .await;
+
+        assert_let_timeout!(Some(_timeline_updates) = timeline_stream.next());
+
+        let items = timeline.items().await;
+        let notification = items.iter().filter_map(|item| item.as_event()).next().unwrap();
+        assert_let!(
+            TimelineItemContent::RtcNotification { active_call_info: Some(active_call_info), .. } =
+                notification.content()
+        );
+        assert!(active_call_info.active_members.contains(&BOB.to_owned()));
+        assert_eq!(active_call_info.call_started_ts_millis.unwrap(), notification_timestamp);
+
+        // the timeline is dropped here with closure.
+    }
+
+    // Come back to the room: a new timeline is built from the event cache.
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let items = timeline.items().await;
+    let notification = items.iter().filter_map(|item| item.as_event()).next().unwrap();
+    assert_eq!(notification.event_id().unwrap(), notification_event_id);
+
+    assert_let!(
+        TimelineItemContent::RtcNotification { active_call_info: Some(active_call_info), .. } =
+            notification.content()
+    );
+    assert!(active_call_info.active_members.contains(&BOB.to_owned()));
+    assert_eq!(active_call_info.call_started_ts_millis.unwrap(), notification_timestamp);
+
+    // Simulate call ending
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_state_event(
+                f.call_membership_state(BOB.to_owned(), "BOB_DEVICE".to_owned())
+                    .leave()
+                    .event_id(event_id!("$bob-left")),
+            ),
+        )
+        .await;
+
+    assert_let_timeout!(Some(_timeline_updates) = timeline_stream.next());
+
+    let items = timeline.items().await;
+    let notification = items.iter().filter_map(|item| item.as_event()).next().unwrap();
+    assert_let!(
+        TimelineItemContent::RtcNotification { active_call_info: None, .. } =
+            notification.content()
+    );
+}
+
 // There is an order in which the initial events are sent, first the membership
 // event is sent, then the notification event is sent.
 // When the membership event is received this will trigger an active call info
@@ -420,4 +519,100 @@ async fn test_only_update_notification_after_it_has_been_marked_as_last() {
         TimelineItemContent::RtcNotification { active_call_info: None, .. } =
             notification.content()
     );
+}
+
+#[async_test]
+async fn test_call_member_changes_resolve_the_notification_outcome() {
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let timeline = room.timeline().await.unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let notification_event_id = event_id!("$notify");
+    let notification_timestamp = MilliSecondsSinceUnixEpoch::now();
+
+    let f = EventFactory::new();
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.rtc_notification(NotificationType::Ring)
+                        .call_intent(CallIntent::Audio)
+                        .sender(&ALICE)
+                        .server_ts(notification_timestamp)
+                        .event_id(notification_event_id),
+                )
+                // The sender joining their own ring is the call starting,
+                // not an answer.
+                .add_timeline_event(
+                    f.call_membership_state(ALICE.to_owned(), "ALICE_DEVICE".to_owned())
+                        .set_livekit_focus(room_id.into(), "https://livekit.localhow".to_owned())
+                        .server_ts(notification_timestamp)
+                        .event_id(event_id!("$alice-joined")),
+                )
+                // BOB answering within the ring window.
+                .add_timeline_event(
+                    f.call_membership_state(BOB.to_owned(), "BOB_DEVICE".to_owned())
+                        .set_livekit_focus(room_id.into(), "https://livekit.localhow".to_owned())
+                        .server_ts(notification_timestamp)
+                        .event_id(event_id!("$bob-joined")),
+                ),
+        )
+        .await;
+
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    let items = timeline.items().await;
+    let notification = items
+        .iter()
+        .filter_map(|item| item.as_event())
+        .find(|item| {
+            matches!(item.content(), TimelineItemContent::RtcNotification { .. })
+        })
+        .expect("the notification item exists");
+    assert_let!(
+        TimelineItemContent::RtcNotification { outcome, notification_type, lifetime_ms, .. } =
+            notification.content()
+    );
+    assert_eq!(outcome.answered_by.as_slice(), [BOB.to_owned()]);
+    assert!(outcome.ended_at.is_none());
+    assert_eq!(*notification_type, Some(NotificationType::Ring));
+    assert_eq!(*lifetime_ms, Some(30_000));
+
+    // BOB leaving supplies the call-end signal.
+    let leave_ts =
+        MilliSecondsSinceUnixEpoch(notification_timestamp.0 + 60_000u32.into());
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.call_membership_left_state(BOB.to_owned(), "BOB_DEVICE".to_owned())
+                    .server_ts(leave_ts)
+                    .event_id(event_id!("$bob-left")),
+            ),
+        )
+        .await;
+
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    let items = timeline.items().await;
+    let notification = items
+        .iter()
+        .filter_map(|item| item.as_event())
+        .find(|item| {
+            matches!(item.content(), TimelineItemContent::RtcNotification { .. })
+        })
+        .expect("the notification item exists");
+    assert_let!(
+        TimelineItemContent::RtcNotification { outcome, .. } = notification.content()
+    );
+    assert_eq!(outcome.answered_by.as_slice(), [BOB.to_owned()]);
+    assert_eq!(outcome.ended_at, Some(leave_ts));
 }

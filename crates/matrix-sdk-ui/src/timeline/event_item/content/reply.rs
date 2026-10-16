@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: a call membership change is never a
+// replied-to event.
 
 use std::sync::Arc;
 
@@ -195,6 +198,11 @@ impl EmbeddedEvent {
             }
             [] => {
                 warn!("No action for an embedded event");
+                Ok(None)
+            }
+            [TimelineAction::RecordCallMemberChange { .. }] => {
+                // A call-membership resolution never stands alone as an
+                // embedded event.
                 Ok(None)
             }
             [_, _, ..] => {

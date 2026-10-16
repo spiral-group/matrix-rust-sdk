@@ -12,6 +12,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: the matrixrtc module.
 
 #![recursion_limit = "256"]
 #![doc = include_str!("../README.md")]
@@ -63,6 +65,9 @@ pub mod sliding_sync;
 pub mod sync;
 #[cfg(feature = "experimental-widgets")]
 pub mod widget;
+
+#[cfg(all(feature = "experimental-matrixrtc", not(target_family = "wasm")))]
+pub mod matrixrtc;
 
 #[cfg(feature = "experimental-search")]
 pub mod message_search;

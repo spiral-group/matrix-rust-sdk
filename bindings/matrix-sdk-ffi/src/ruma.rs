@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: the interactive post message type
+// (com.spiral.app) and its FFI.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -448,10 +451,36 @@ pub enum MessageType {
     Location {
         content: LocationContent,
     },
+    /// SPIRAL (Brief 0066, ADR-0007): an Interactive Post.
+    ///
+    /// A first-class message type, beside `Image` and `Location`, because that
+    /// is what it is: content a person published. Modelling it as `Other` and
+    /// re-parsing the raw event in each client would leave every reader to
+    /// rediscover the same shape — and to get it subtly differently.
+    InteractivePost {
+        content: InteractivePostContent,
+    },
+    /// Brief 0066 step 6 — a generated post the owner previews and
+    /// publishes; the agent wrote it into the owner's DM thread.
+    InteractiveDraft {
+        content: InteractiveDraftContent,
+    },
+    /// Any msgtype the SDK has no type for. `data` is the rest of the
+    /// content as a JSON object string (`body` and `msgtype` removed), so a
+    /// client can render its own custom messages from their variables —
+    /// Spiral's `com.spiral.notice` (Brief 0073): the server sends the
+    /// facts, the client the words, in the reader's language. `"{}"` when
+    /// there is nothing beyond the body.
     Other {
         msgtype: String,
         body: String,
+        data: String,
     },
+}
+
+/// The extra keys of a custom message as a JSON string for `MessageType::Other`.
+fn custom_data_json(value: &RumaMessageType) -> String {
+    serde_json::to_string(&*value.data()).unwrap_or_else(|_| "{}".to_owned())
 }
 
 /// From MSC2530: https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/2530-body-as-caption.md
@@ -496,8 +525,17 @@ impl TryFrom<MessageType> for RumaMessageType {
             MessageType::Location { content } => {
                 Self::Location(RumaLocationMessageEventContent::new(content.body, content.geo_uri))
             }
-            MessageType::Other { msgtype, body } => {
-                Self::new(&msgtype, body, JsonObject::default())?
+            MessageType::InteractivePost { content } => {
+                let body = content.body.clone();
+                Self::new(crate::spiral_apps::APP_MSGTYPE, body, content.into())?
+            }
+            MessageType::InteractiveDraft { content } => {
+                let body = content.body.clone();
+                Self::new(crate::spiral_apps::DRAFT_MSGTYPE, body, content.into())?
+            }
+            MessageType::Other { msgtype, body, data } => {
+                let data: JsonObject = serde_json::from_str(&data).unwrap_or_default();
+                Self::new(&msgtype, body, data)?
             }
         })
     }
@@ -545,9 +583,33 @@ impl TryFrom<RumaMessageType> for MessageType {
                     },
                 }
             }
+            RumaMessageType::_Custom(_) if value.msgtype() == crate::spiral_apps::DRAFT_MSGTYPE => {
+                match InteractiveDraftContent::from_message(value.body(), &value.data()) {
+                    Some(content) => MessageType::InteractiveDraft { content },
+                    None => MessageType::Other {
+                        msgtype: value.msgtype().to_owned(),
+                        body: value.body().to_owned(),
+                        data: custom_data_json(&value),
+                    },
+                }
+            }
+            RumaMessageType::_Custom(_) if value.msgtype() == crate::spiral_apps::APP_MSGTYPE => {
+                match InteractivePostContent::from_message(value.body(), &value.data()) {
+                    Some(content) => MessageType::InteractivePost { content },
+                    // A post missing what it needs to run is not a degraded
+                    // post; it is one no client could start. It travels on as
+                    // an ordinary unknown message, which still shows its body.
+                    None => MessageType::Other {
+                        msgtype: value.msgtype().to_owned(),
+                        body: value.body().to_owned(),
+                        data: custom_data_json(&value),
+                    },
+                }
+            }
             _ => MessageType::Other {
                 msgtype: value.msgtype().to_owned(),
                 body: value.body().to_owned(),
+                data: custom_data_json(&value),
             },
         })
     }
@@ -1007,6 +1069,173 @@ pub struct LocationContent {
     pub description: Option<String>,
     pub zoom_level: Option<u8>,
     pub asset: AssetType,
+}
+
+/// SPIRAL (Brief 0066, ADR-0007 § 5.1): what a post says about its artifact,
+/// before any of it is fetched.
+///
+/// Everything here is read from the event, so a row can be sized and named
+/// without a network round trip. What the bytes turn out to be is the client's
+/// business; this only carries what the sender claimed.
+#[derive(Clone, uniffi::Record)]
+pub struct InteractivePostContent {
+    /// The `body` every message carries. What clients that do not know this
+    /// msgtype will show, and the fallback name for those that do.
+    pub body: String,
+    pub app_id: String,
+    /// Runtime major version the artifact was written against.
+    pub runtime: String,
+    /// Shown on the card and in a room list while nothing is running.
+    pub title: String,
+    /// `w:h`. Lets a row take its final size before the artifact loads.
+    pub aspect: String,
+    pub state_channel: String,
+    /// Lowercase hex SHA-256 of the packed artifact.
+    pub sha256: String,
+    /// `mxc://` when the room is not encrypted.
+    pub url: Option<String>,
+    /// An `EncryptedFile`, as JSON, when it is.
+    pub file_json: Option<String>,
+}
+
+impl From<InteractivePostContent> for JsonObject {
+    /// The fields that travel BESIDE `msgtype` and `body`.
+    ///
+    /// `body` is not repeated here: `RumaMessageType::new` writes it, and a
+    /// second copy in the data would be a second source of truth for the one
+    /// string every other client renders.
+    fn from(content: InteractivePostContent) -> Self {
+        let mut data = JsonObject::new();
+        data.insert("app_id".to_owned(), content.app_id.into());
+        data.insert("runtime".to_owned(), content.runtime.into());
+        data.insert("title".to_owned(), content.title.into());
+        data.insert("aspect".to_owned(), content.aspect.into());
+        data.insert("state_channel".to_owned(), content.state_channel.into());
+        data.insert("sha256".to_owned(), content.sha256.into());
+
+        if let Some(url) = content.url {
+            data.insert("url".to_owned(), url.into());
+        }
+
+        // Parsed back, not stored as a string: `file` is an object in the
+        // event, and shipping it as text would make every reader unwrap it.
+        if let Some(file_json) = content.file_json
+            && let Ok(file) = serde_json::from_str::<serde_json::Value>(&file_json)
+        {
+            data.insert("file".to_owned(), file);
+        }
+
+        data
+    }
+}
+
+impl InteractivePostContent {
+    /// Read a post out of a custom message's data.
+    ///
+    /// `None` when the claim is incomplete — no app, no digest, or nowhere to
+    /// fetch from. Refusing here keeps every client from having to decide
+    /// separately what half a post means.
+    fn from_message(body: &str, data: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        let text = |key: &str| data.get(key).and_then(|value| value.as_str());
+        let non_empty = |key: &str| text(key).filter(|value| !value.is_empty());
+
+        let app_id = non_empty("app_id")?.to_owned();
+        let sha256 = non_empty("sha256")?.to_owned();
+
+        let url = non_empty("url").map(ToOwned::to_owned);
+        let file_json = data
+            .get("file")
+            .filter(|file| file.get("url").and_then(|url| url.as_str()).is_some())
+            .and_then(|file| serde_json::to_string(file).ok());
+
+        if url.is_none() && file_json.is_none() {
+            return None;
+        }
+
+        Some(Self {
+            body: body.to_owned(),
+            title: non_empty("title").unwrap_or(body).to_owned(),
+            app_id,
+            runtime: non_empty("runtime").unwrap_or("1").to_owned(),
+            aspect: non_empty("aspect").unwrap_or("1:1").to_owned(),
+            state_channel: non_empty("state_channel").unwrap_or("matrix").to_owned(),
+            sha256,
+            url,
+            file_json,
+        })
+    }
+}
+
+/// Brief 0066 step 6 — what a draft carries: everything the client needs
+/// to preview it (source + manifest) and to publish it (the manifest TEXT
+/// to pack as is, and the digest the agent computed from that packing).
+#[derive(Clone, uniffi::Record)]
+pub struct InteractiveDraftContent {
+    pub body: String,
+    pub title: String,
+    pub aspect: String,
+    /// The manifest exactly as the agent serialised it — carried in the
+    /// event as a STRING, not an object, because `serde_json` here does
+    /// not preserve key order and a re-serialised manifest would pack to
+    /// a different digest than the agent's.
+    pub manifest_json: String,
+    pub source: String,
+    /// Lowercase hex SHA-256 of `pack(manifest_json, source)`.
+    pub sha256: String,
+    /// 1 for the first draft in a thread, 2 for the next change, …
+    pub version: u32,
+    /// The agent that generated it, when it says.
+    pub generated_by_agent_id: Option<String>,
+    /// The room the post is FOR — copied by the agent from the request at
+    /// the root of the thread, so the client can publish there from the
+    /// draft's row without asking again.
+    pub target_room_id: Option<String>,
+}
+
+impl From<InteractiveDraftContent> for JsonObject {
+    fn from(content: InteractiveDraftContent) -> Self {
+        let mut data = JsonObject::new();
+        data.insert("title".to_owned(), content.title.into());
+        data.insert("aspect".to_owned(), content.aspect.into());
+        data.insert("manifest_json".to_owned(), content.manifest_json.into());
+        data.insert("source".to_owned(), content.source.into());
+        data.insert("sha256".to_owned(), content.sha256.into());
+        data.insert("v".to_owned(), content.version.into());
+        if let Some(agent_id) = content.generated_by_agent_id {
+            data.insert("generated_by".to_owned(), serde_json::json!({ "agent_id": agent_id }));
+        }
+        if let Some(room_id) = content.target_room_id {
+            data.insert("target_room_id".to_owned(), room_id.into());
+        }
+        data
+    }
+}
+
+impl InteractiveDraftContent {
+    fn from_message(body: &str, data: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        let text = |key: &str| data.get(key).and_then(|value| value.as_str());
+        let non_empty = |key: &str| text(key).filter(|value| !value.is_empty());
+
+        let source = non_empty("source")?.to_owned();
+        let sha256 = non_empty("sha256")?.to_owned();
+        let manifest_json = non_empty("manifest_json")?.to_owned();
+
+        Some(Self {
+            body: body.to_owned(),
+            title: non_empty("title").unwrap_or(body).to_owned(),
+            aspect: non_empty("aspect").unwrap_or("4:3").to_owned(),
+            manifest_json,
+            source,
+            sha256,
+            version: data.get("v").and_then(|v| v.as_u64()).unwrap_or(1) as u32,
+            generated_by_agent_id: data
+                .get("generated_by")
+                .and_then(|g| g.get("agent_id"))
+                .and_then(|a| a.as_str())
+                .map(ToOwned::to_owned),
+            target_room_id: non_empty("target_room_id").map(ToOwned::to_owned),
+        })
+    }
 }
 
 #[derive(Clone, uniffi::Enum)]
@@ -1954,5 +2183,220 @@ mod galleries {
                 },
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod interactive_post_tests {
+    use matrix_sdk::ruma::events::room::message::MessageType as RumaMessageType;
+    use serde_json::json;
+
+    use super::{InteractivePostContent, MessageType};
+    use crate::spiral_apps::APP_MSGTYPE;
+
+    fn custom(data: serde_json::Value) -> RumaMessageType {
+        let object = data.as_object().expect("an object").clone();
+        RumaMessageType::new(APP_MSGTYPE, "Where to?".to_owned(), object).expect("valid msgtype")
+    }
+
+    /// Brief 0073 — a client renders its own notices from their variables.
+    #[test]
+    fn an_unknown_msgtype_carries_its_extra_keys_as_json() {
+        let ruma = RumaMessageType::new(
+            "com.spiral.notice",
+            "@alice:spiral.md joined Spiral through your invitation.".to_owned(),
+            json!({ "com.spiral.notice": { "kind": "referral_joined", "joined_user_id": "@alice:spiral.md" } })
+                .as_object()
+                .expect("an object")
+                .clone(),
+        )
+        .expect("valid msgtype");
+
+        let message: MessageType = ruma.try_into().expect("converts");
+        let MessageType::Other { msgtype, body, data } = message else {
+            panic!("a notice arrived as something else");
+        };
+        assert_eq!(msgtype, "com.spiral.notice");
+        assert!(body.starts_with("@alice:spiral.md"));
+        let parsed: serde_json::Value = serde_json::from_str(&data).expect("json");
+        assert_eq!(parsed["com.spiral.notice"]["kind"], "referral_joined");
+        assert_eq!(parsed["com.spiral.notice"]["joined_user_id"], "@alice:spiral.md");
+        assert!(parsed.get("body").is_none(), "body is not repeated in data");
+
+        // And back: the data travels into the content unchanged.
+        let round: RumaMessageType =
+            MessageType::Other { msgtype, body, data }.try_into().expect("back");
+        assert_eq!(round.data()["com.spiral.notice"]["kind"], "referral_joined");
+    }
+
+    #[test]
+    fn a_plain_unknown_msgtype_has_empty_data() {
+        let ruma = RumaMessageType::new("com.example.thing", "hi".to_owned(), Default::default())
+            .expect("valid");
+        let MessageType::Other { data, .. } = ruma.try_into().expect("converts") else { panic!() };
+        assert_eq!(data, "{}");
+    }
+
+    #[test]
+    fn a_complete_post_becomes_its_own_message_type() {
+        let message: MessageType = custom(json!({
+            "app_id": "poll",
+            "sha256": "abc",
+            "url": "mxc://spiral.md/xyz",
+            "title": "Where to?",
+            "aspect": "4:3"
+        }))
+        .try_into()
+        .expect("converts");
+
+        let MessageType::InteractivePost { content } = message else {
+            panic!("a post arrived as something else");
+        };
+        assert_eq!(content.app_id, "poll");
+        assert_eq!(content.sha256, "abc");
+        assert_eq!(content.url.as_deref(), Some("mxc://spiral.md/xyz"));
+        assert_eq!(content.aspect, "4:3");
+        assert_eq!(content.body, "Where to?");
+    }
+
+    #[test]
+    fn a_post_naming_no_artifact_stays_an_ordinary_message() {
+        // Neither `url` nor `file`: nothing to fetch, so nothing to run. It
+        // keeps its body and shows like any unknown message rather than
+        // pretending to be startable.
+        let message: MessageType =
+            custom(json!({ "app_id": "poll", "sha256": "abc" })).try_into().expect("converts");
+
+        assert!(matches!(message, MessageType::Other { .. }));
+    }
+
+    #[test]
+    fn an_encrypted_post_carries_its_file() {
+        let message: MessageType = custom(json!({
+            "app_id": "poll",
+            "sha256": "abc",
+            "file": { "url": "mxc://spiral.md/enc", "key": { "k": "…" } }
+        }))
+        .try_into()
+        .expect("converts");
+
+        let MessageType::InteractivePost { content } = message else {
+            panic!("a post arrived as something else");
+        };
+        assert!(content.url.is_none());
+        assert!(content.file_json.expect("file").contains("mxc://spiral.md/enc"));
+    }
+
+    #[test]
+    fn the_title_falls_back_to_the_body_every_client_shows() {
+        let message: MessageType = custom(json!({
+            "app_id": "poll",
+            "sha256": "abc",
+            "url": "mxc://spiral.md/xyz"
+        }))
+        .try_into()
+        .expect("converts");
+
+        let MessageType::InteractivePost { content } = message else {
+            panic!("a post arrived as something else");
+        };
+        assert_eq!(content.title, "Where to?");
+    }
+
+    #[test]
+    fn sending_a_post_puts_its_fields_beside_the_body() {
+        // The round trip matters: a post this SDK sends must be one it reads
+        // back, or two clients of the same build would disagree.
+        let original = InteractivePostContent {
+            body: "Where to?".to_owned(),
+            app_id: "poll".to_owned(),
+            runtime: "1".to_owned(),
+            title: "Where to?".to_owned(),
+            aspect: "4:3".to_owned(),
+            state_channel: "matrix".to_owned(),
+            sha256: "abc".to_owned(),
+            url: Some("mxc://spiral.md/xyz".to_owned()),
+            file_json: None,
+        };
+
+        let sent: RumaMessageType =
+            MessageType::InteractivePost { content: original }.try_into().expect("converts");
+        assert_eq!(sent.msgtype(), APP_MSGTYPE);
+
+        let read_back: MessageType = sent.try_into().expect("converts");
+        let MessageType::InteractivePost { content } = read_back else {
+            panic!("what we sent did not come back as a post");
+        };
+        assert_eq!(content.app_id, "poll");
+        assert_eq!(content.url.as_deref(), Some("mxc://spiral.md/xyz"));
+    }
+}
+
+#[cfg(test)]
+mod interactive_draft_tests {
+    use matrix_sdk::ruma::events::room::message::MessageType as RumaMessageType;
+    use serde_json::json;
+
+    use super::{InteractiveDraftContent, MessageType};
+    use crate::spiral_apps::DRAFT_MSGTYPE;
+
+    // Key order that `serde_json` here would NOT preserve if it re-serialised.
+    const MANIFEST: &str = r#"{"app_id":"gen-1","runtime":"1","entry":"app.jsx","aspect":"4:3"}"#;
+
+    fn custom(data: serde_json::Value) -> RumaMessageType {
+        let object = data.as_object().expect("an object").clone();
+        RumaMessageType::new(DRAFT_MSGTYPE, "<source>…</source>".to_owned(), object).expect("valid")
+    }
+
+    #[test]
+    fn a_draft_becomes_its_own_message_type_and_keeps_the_manifest_text_verbatim() {
+        let message: MessageType = custom(json!({
+            "title": "Lunch poll",
+            "aspect": "3:4",
+            "manifest_json": MANIFEST,
+            "source": "export default () => null;",
+            "sha256": "abc",
+            "v": 2,
+            "generated_by": { "agent_id": "a-1" }
+        }))
+        .try_into()
+        .expect("converts");
+
+        let MessageType::InteractiveDraft { content } = message else {
+            panic!("a draft arrived as something else");
+        };
+        assert_eq!(content.manifest_json, MANIFEST, "the manifest text was re-serialised");
+        assert_eq!(content.version, 2);
+        assert_eq!(content.generated_by_agent_id.as_deref(), Some("a-1"));
+        assert_eq!(content.aspect, "3:4");
+    }
+
+    #[test]
+    fn a_draft_without_source_or_digest_stays_an_ordinary_message() {
+        let message: MessageType = custom(json!({ "title": "x" })).try_into().expect("converts");
+        assert!(matches!(message, MessageType::Other { .. }));
+    }
+
+    #[test]
+    fn sending_a_draft_round_trips() {
+        let content = InteractiveDraftContent {
+            body: "b".into(),
+            title: "t".into(),
+            aspect: "1:1".into(),
+            manifest_json: MANIFEST.into(),
+            source: "export default () => null;".into(),
+            sha256: "abc".into(),
+            version: 1,
+            generated_by_agent_id: None,
+            target_room_id: Some("!target:spiral.md".into()),
+        };
+        let sent: RumaMessageType =
+            MessageType::InteractiveDraft { content }.try_into().expect("sends");
+        assert_eq!(sent.msgtype(), DRAFT_MSGTYPE);
+        let back: MessageType = sent.try_into().expect("reads");
+        let MessageType::InteractiveDraft { content } = back else { panic!() };
+        assert_eq!(content.manifest_json, MANIFEST);
+        assert_eq!(content.generated_by_agent_id, None);
+        assert_eq!(content.target_room_id.as_deref(), Some("!target:spiral.md"));
     }
 }

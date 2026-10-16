@@ -1,3 +1,6 @@
+// Modified by the Spiral authors, 2026: the matrixrtc, spiral_agents,
+// spiral_apps and spiral_presence modules.
+
 #![recursion_limit = "256"]
 #![allow(unused_qualifications, clippy::new_without_default)]
 // Needed because uniffi macros contain empty lines after docs.
@@ -16,6 +19,10 @@ mod event;
 mod helpers;
 mod identity_status_change;
 mod live_locations_observer;
+// Native MatrixRTC needs the crypto + HTTP stack that is only built for
+// non-wasm targets.
+#[cfg(not(target_family = "wasm"))]
+mod matrixrtc;
 mod notification;
 mod notification_settings;
 mod password_strength;
@@ -33,6 +40,10 @@ mod runtime;
 mod search_service;
 mod session_verification;
 mod spaces;
+// SPIRAL (Brief 0066): Interactive Post timeline filter + relations FFI.
+mod spiral_agents;
+mod spiral_apps;
+mod spiral_presence;
 mod store;
 mod sync_service;
 mod sync_v2;

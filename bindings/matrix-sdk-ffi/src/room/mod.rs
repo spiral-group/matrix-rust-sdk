@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for that specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: room timelines filter events through
+// spiral_event_filter, so interactive posts (com.spiral.app) are kept.
 
 use std::{collections::HashMap, fs, path::PathBuf, pin::pin, sync::Arc};
 
@@ -253,7 +256,11 @@ impl Room {
 
         match configuration.filter {
             TimelineFilter::All => {
-                // #nofilter.
+                // SPIRAL (Brief 0066): "no filter" still runs the builder's
+                // `default_event_filter`, which drops unknown message-like
+                // types — including the Interactive Post (`com.spiral.app`).
+                // Compose rather than patch upstream.
+                builder = builder.event_filter(crate::spiral_apps::spiral_event_filter);
             }
 
             TimelineFilter::OnlyMessage { types } => {
@@ -274,9 +281,14 @@ impl Room {
             }
 
             TimelineFilter::EventFilter { filter: event_filter } => {
+                // SPIRAL (Brief 0066): the client's LIVE room timeline
+                // arrives through this arm, not `All` — the post must pass
+                // here too or it never shows in chat (the session-event
+                // lesson from device day run 4, 2026-09-13).
                 builder = builder.event_filter(move |event, room_version_id| {
                     // Always perform the default filter first
-                    default_event_filter(event, room_version_id) && event_filter.filter(event)
+                    crate::spiral_apps::spiral_event_filter(event, room_version_id)
+                        && event_filter.filter(event)
                 });
             }
         }

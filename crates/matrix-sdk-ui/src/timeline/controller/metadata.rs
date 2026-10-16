@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: the call membership changes the
+// timeline has seen, from which call outcomes are computed.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -35,7 +38,7 @@ use tracing::trace;
 
 use super::{
     super::{TimelineItem, TimelineItemKind, TimelineUniqueId, subscriber::skip::SkipCount},
-    ActiveCallInfo, Aggregation, AggregationKind, Aggregations, AllRemoteEvents,
+    ActiveCallInfo, Aggregation, AggregationKind, Aggregations, AllRemoteEvents, CallMemberChange,
     ObservableItemsTransaction, PendingEdit, PendingEditKind,
     read_receipts::ReadReceipts,
 };
@@ -145,6 +148,14 @@ pub(in crate::timeline) struct TimelineMetadata {
     /// change. It is cached to be attached dynamically to the latest
     /// RtcNotification event inserted in the timeline.
     pub(crate) active_call: Option<ActiveCallInfo>,
+
+    /// Spiral: every call membership change the timeline has seen, sorted by
+    /// server timestamp, one per event. Notification outcomes and the
+    /// adoption of a ringing tile are computed from them, so neither depends
+    /// on the order events were loaded in. Kept across clears: they are
+    /// facts about the room, and a cleared timeline's rings come back
+    /// before the older memberships do.
+    pub(in crate::timeline) call_member_changes: Vec<CallMemberChange>,
 }
 
 impl TimelineMetadata {
@@ -172,7 +183,17 @@ impl TimelineMetadata {
             is_room_encrypted,
             active_rtc_notification_event_id: None,
             active_call: None,
+            call_member_changes: Vec::new(),
         }
+    }
+
+    /// Records a call membership change, once per event.
+    pub(in crate::timeline) fn record_call_member_change(&mut self, change: CallMemberChange) {
+        if self.call_member_changes.iter().any(|known| known.event_id == change.event_id) {
+            return;
+        }
+        let at = self.call_member_changes.partition_point(|known| known.ts <= change.ts);
+        self.call_member_changes.insert(at, change);
     }
 
     pub(super) fn with_active_call_info(self, active_call_info: Option<ActiveCallInfo>) -> Self {
@@ -189,6 +210,10 @@ impl TimelineMetadata {
         // before attempting to update it for each new timeline item.
         self.has_up_to_date_read_marker_item = true;
         self.read_receipts.clear();
+        // Spiral (F7): the tile holding the call is gone with the items; a
+        // kept id makes the same notification, re-added, look attached. The
+        // call itself (`active_call`) is room state and stays.
+        self.active_rtc_notification_event_id = None;
     }
 
     /// Get the relative positions of two events in the timeline.

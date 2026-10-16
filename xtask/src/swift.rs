@@ -1,3 +1,6 @@
+// Modified by the Spiral authors, 2026: the build remaps the paths it embeds
+// in the library (BuildPathRemap).
+
 use std::{
     collections::HashMap,
     fs::{copy, create_dir_all, remove_dir_all, remove_file, rename},
@@ -367,6 +370,97 @@ fn build_xcframework(
     Ok(())
 }
 
+/// Spiral: the prefixes rewritten in the paths a build embeds in the library
+/// (panic locations, `file!()`, C `__FILE__` and debug info), so that it names
+/// neither the builder's home directory nor where the checkout sits.
+struct BuildPathRemap {
+    rustflags: Vec<String>,
+    cflags: Vec<String>,
+    root: Utf8PathBuf,
+    target: Utf8PathBuf,
+}
+
+/// Crates whose library code reads `env!("CARGO_MANIFEST_DIR")`, which no
+/// remapping flag reaches: matrix-sdk-test's key fixtures call insta's
+/// snapshot macros outside tests.
+const MANIFEST_DIR_CRATES: &[&str] = &["matrix-sdk-test"];
+
+impl BuildPathRemap {
+    fn new() -> Result<Self> {
+        let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+        let in_home = |name: &str| home.as_ref().map(|home| format!("{home}/{name}"));
+        let cargo_home = std::env::var("CARGO_HOME").ok().or_else(|| in_home(".cargo"));
+        let rustup_home = std::env::var("RUSTUP_HOME").ok().or_else(|| in_home(".rustup"));
+        let root = workspace::root_path()?;
+        let target = workspace::target_path()?;
+
+        // rustc applies the last prefix that matches, so the broadest comes
+        // first; clang matches the longest prefix whatever the order.
+        let mut mappings = Vec::new();
+        mappings.extend(home.map(|from| (from, "/home")));
+        mappings.extend(cargo_home.map(|from| (from, "/cargo")));
+        mappings.extend(rustup_home.map(|from| (from, "/rustup")));
+        mappings.push((root.to_string(), "/matrix-rust-sdk"));
+        if !target.starts_with(&root) {
+            mappings.push((target.to_string(), "/target"));
+        }
+
+        // Cargo splits these variables on whitespace, so a path that contains
+        // a space can't be remapped here.
+        let (mappings, skipped): (Vec<_>, Vec<_>) =
+            mappings.into_iter().partition(|(from, _)| !from.contains(char::is_whitespace));
+        for (from, _) in skipped {
+            println!("-- Not remapping {from}: the path contains whitespace");
+        }
+
+        Ok(Self {
+            root,
+            target,
+            rustflags: mappings
+                .iter()
+                .map(|(from, to)| format!("--remap-path-prefix={from}={to}"))
+                .collect(),
+            cflags: std::env::var("CFLAGS")
+                .ok()
+                .into_iter()
+                .chain(mappings.iter().map(|(from, to)| format!("-ffile-prefix-map={from}={to}")))
+                .collect(),
+        })
+    }
+}
+
+impl BuildPathRemap {
+    /// A `RUSTC_WRAPPER` that gives the crates in [`MANIFEST_DIR_CRATES`] a
+    /// `CARGO_MANIFEST_DIR` relative to the workspace root, or `None` when a
+    /// wrapper is already set (such as sccache), which this leaves alone.
+    /// It must stay a real path: proc macros (ruma's derives) read the
+    /// crate's Cargo.toml through it, and rustc runs in the workspace root.
+    fn manifest_dir_wrapper(&self) -> Result<Option<Utf8PathBuf>> {
+        if std::env::var_os("RUSTC_WRAPPER").is_some_and(|wrapper| !wrapper.is_empty()) {
+            println!("-- RUSTC_WRAPPER is set: CARGO_MANIFEST_DIR is not remapped");
+            return Ok(None);
+        }
+        let crates = MANIFEST_DIR_CRATES.join("|");
+        let root = &self.root;
+        let script = format!(
+            "#!/bin/sh\n\
+             # Written by `cargo xtask swift`: see BuildPathRemap.\n\
+             case \"$CARGO_PKG_NAME\" in {crates})\n\
+             \x20 case \"$CARGO_MANIFEST_DIR\" in '{root}'/*)\n\
+             \x20   CARGO_MANIFEST_DIR=\"${{CARGO_MANIFEST_DIR#'{root}'/}}\"\n\
+             \x20   export CARGO_MANIFEST_DIR;;\n\
+             \x20 esac;;\n\
+             esac\n\
+             exec \"$@\"\n"
+        );
+        create_dir_all(&self.target)?;
+        let wrapper = self.target.join("spiral-rustc-wrapper.sh");
+        std::fs::write(&wrapper, script)?;
+        std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        Ok(Some(wrapper))
+    }
+}
+
 /// Builds the SDK for the specified targets and profile.
 fn build_targets(
     targets: Vec<&Target>,
@@ -379,8 +473,28 @@ fn build_targets(
 
     // Note: `push_env` stores environment variables and returns a RAII guard that
     // will restore the environment variable to its previous value when dropped.
-    let _env_guard1 =
-        sh.push_env("CARGO_TARGET_AARCH64_APPLE_IOS_RUSTFLAGS", "-Clinker=/usr/bin/clang");
+    //
+    // Spiral: the rustflags are per target, so that the linker flag
+    // aarch64-apple-ios needs stays and every target also gets the path
+    // remapping (a `RUSTFLAGS` would replace both).
+    let remap = BuildPathRemap::new()?;
+    let _rustflags_guards = targets
+        .iter()
+        .map(|target| {
+            let mut flags = remap.rustflags.clone();
+            if target.triple == "aarch64-apple-ios" {
+                flags.insert(0, "-Clinker=/usr/bin/clang".to_owned());
+            }
+            let variable = format!(
+                "CARGO_TARGET_{}_RUSTFLAGS",
+                target.triple.to_uppercase().replace('-', "_")
+            );
+            sh.push_env(variable, flags.join(" "))
+        })
+        .collect::<Vec<_>>();
+    let _cflags_guard = sh.push_env("CFLAGS", remap.cflags.join(" "));
+    let _wrapper_guard =
+        remap.manifest_dir_wrapper()?.map(|wrapper| sh.push_env("RUSTC_WRAPPER", wrapper));
     let _env_guard2 = sh.push_env("AARCH64_APPLE_IOS_CC", "/usr/bin/clang");
     let _env_guard3 =
         ios_deployment_target.map(|target| sh.push_env("IPHONEOS_DEPLOYMENT_TARGET", target));

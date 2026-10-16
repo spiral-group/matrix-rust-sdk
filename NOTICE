@@ -1,0 +1,21 @@
+matrix-rust-sdk, Spiral's fork
+Copyright 2026 the Spiral authors.
+
+"The Spiral authors" is Andrii Panasiuk, the individual developer who
+publishes Spiral and holds the copyright in Spiral's code. Spiral is the
+product's name, not a company.
+
+Source requests: support@spiral.md
+
+This repository is a modified version of matrix-rust-sdk
+(https://github.com/matrix-org/matrix-rust-sdk), Copyright The Matrix.org
+Foundation C.I.C. and its contributors, licensed under the Apache License,
+Version 2.0 (LICENSE).
+
+The Spiral authors modified it in 2026. Their changes are licensed under the
+Apache License, Version 2.0, too. They sit on top of the upstream tag
+matrix-sdk-ffi/20260728, so `git diff matrix-sdk-ffi/20260728` lists every
+file they added or changed. The files they added carry the header
+"Copyright 2026 the Spiral authors.". Every upstream file they changed says
+so in its header ("Modified by the Spiral authors, 2026: ..."), except
+Cargo.lock, which Cargo generates.

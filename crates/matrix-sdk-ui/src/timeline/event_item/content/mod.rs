@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: RtcCallOutcome, and a call
+// notification's type, lifetime and outcome.
 
 use std::sync::Arc;
 
@@ -18,7 +21,7 @@ use as_variant::as_variant;
 use matrix_sdk::{Room, deserialized_responses::TimelineEvent};
 use matrix_sdk_base::crypto::types::events::UtdCause;
 use ruma::{
-    OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
+    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
     events::{
         AnyMessageLikeEventContent, AnyStateEventContentChange, Mentions, MessageLikeEventType,
         StateEventContentChange, StateEventType,
@@ -46,7 +49,7 @@ use ruma::{
             tombstone::RoomTombstoneEventContent,
             topic::RoomTopicEventContent,
         },
-        rtc::notification::CallIntent,
+        rtc::notification::{CallIntent, NotificationType as RtcNotificationType},
         space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
         sticker::StickerEventContent,
     },
@@ -133,7 +136,46 @@ pub enum TimelineItemContent {
         /// Information about the active call, if this notification is about an
         /// active call.
         active_call_info: Option<ActiveCallInfo>,
+        /// How this notification asked receivers to notify (MSC4075
+        /// `notification_type`), verbatim from the event.
+        notification_type: Option<RtcNotificationType>,
+        /// The ring window (MSC4075 `lifetime`) in milliseconds, verbatim
+        /// from the event. The notification expires at the event's origin
+        /// timestamp plus this value.
+        lifetime_ms: Option<u64>,
+        /// What happened to the call this notification rang for, derived
+        /// from the call membership events in the timeline (Spiral).
+        outcome: RtcCallOutcome,
     },
+}
+
+/// What happened to the call an `m.rtc.notification` rang for (Spiral).
+///
+/// Derived from the `m.call.member` events the timeline has seen, by their
+/// server timestamps: a membership belongs to the notification whose span
+/// contains it, from the notification (a joining membership up to 10 s
+/// before it: the caller joins, then rings) to the next notification. It is
+/// recomputed whenever a notification or a membership event is handled, so
+/// it does not depend on the order the events were loaded in, and a
+/// notification rebuilt in place keeps it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RtcCallOutcome {
+    /// Users other than the sender whose membership became active within
+    /// the ring window (the notification's lifetime, at most 90 s): who
+    /// answered the ring. In joining order.
+    pub answered_by: Vec<OwnedUserId>,
+    /// When the first of them joined.
+    pub answered_at: Option<MilliSecondsSinceUnixEpoch>,
+    /// Everyone whose membership became active during the call, the sender
+    /// included, with no ring window. In joining order.
+    pub joined_by: Vec<OwnedUserId>,
+    /// When someone other than the sender first joined, ring window or not.
+    pub first_joined_at: Option<MilliSecondsSinceUnixEpoch>,
+    /// Whether the user of this timeline joined the call.
+    pub own_user_joined: bool,
+    /// The last membership departure during the call: when it ended, once
+    /// it has.
+    pub ended_at: Option<MilliSecondsSinceUnixEpoch>,
 }
 
 impl TimelineItemContent {

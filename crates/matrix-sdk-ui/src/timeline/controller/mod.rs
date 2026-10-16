@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: a late call membership adopts the
+// ringing notification of its call.
 
 use std::{
     collections::BTreeSet,
@@ -64,6 +67,7 @@ pub(super) use self::{
         AllRemoteEvents, ObservableItems, ObservableItemsEntry, ObservableItemsTransaction,
         ObservableItemsTransactionEntry,
     },
+    rtc::{CallMemberChange, rtc_call_outcomes, rtc_notification_ringing_at},
     state::TimelineState,
     state_transaction::TimelineStateTransaction,
 };
@@ -95,6 +99,7 @@ mod decryption_retry_task;
 mod metadata;
 mod observable_items;
 mod read_receipts;
+mod rtc;
 mod state;
 mod state_transaction;
 
@@ -800,6 +805,36 @@ impl<P: RoomDataProvider> TimelineController<P> {
         // Store the current active call info in metadata for new RtcNotification items
         txn.meta.active_call = maybe_active_call.clone();
 
+        // Spiral (F7): the notification can reach the timeline before the
+        // room info carries the membership. It was handled with no active
+        // call, so no tile holds the call yet (or the one that did is gone);
+        // adopt the newest notification when a membership the timeline
+        // handled belongs to its ring. If none did yet, the membership event
+        // adopts it when it is handled.
+        if maybe_active_call.is_some() {
+            let tile_is_held = txn
+                .meta
+                .active_rtc_notification_event_id
+                .as_ref()
+                .is_some_and(|event_id| rfind_event_by_id(&txn.items, event_id).is_some());
+            if !tile_is_held {
+                // Each member's latest join is their join into this call;
+                // older ones belong to earlier calls.
+                let active_members = maybe_active_call.as_ref().map(|call| &call.active_members);
+                let changes = &txn.meta.call_member_changes;
+                txn.meta.active_rtc_notification_event_id = active_members
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|member| {
+                        changes
+                            .iter()
+                            .rev()
+                            .find(|change| change.is_join && change.user_id == *member)
+                    })
+                    .find_map(|change| rtc_notification_ringing_at(&txn.items, change.ts));
+            }
+        }
+
         if let Some(existing_event_id) = &txn.meta.active_rtc_notification_event_id {
             // Clean up the notification event
             let last_notification = rfind_event_by_id(&txn.items, existing_event_id);
@@ -809,12 +844,18 @@ impl<P: RoomDataProvider> TimelineController<P> {
                         call_intent,
                         declined_by,
                         active_call_info: _active_call_info,
+                        notification_type,
+                        lifetime_ms,
+                        outcome,
                     } => Some(TimelineItemContent::RtcNotification {
                         call_intent: call_intent.to_owned(),
                         declined_by: declined_by.clone(),
                         active_call_info: maybe_active_call
                             .clone()
                             .map(|info| info.with_start_time(last_notification.timestamp.into())),
+                        notification_type: notification_type.clone(),
+                        lifetime_ms: *lifetime_ms,
+                        outcome: outcome.clone(),
                     }),
                     _ => None,
                 };

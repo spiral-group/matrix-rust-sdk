@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: exports RtcCallOutcome.
 
 //! A high-level view into a room's contents.
 //!
@@ -94,8 +96,8 @@ pub use self::{
         MediaUploadProgress, MemberProfileChange, MembershipChange, Message, MsgLikeContent,
         MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState, Profile, ReactionInfo,
         ReactionStatus, ReactionsByKeyBySender, RoomMembershipChange, RoomPinnedEventsChange,
-        Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId, TimelineEventShieldState,
-        TimelineEventShieldStateCode, TimelineItemContent,
+        RtcCallOutcome, Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId,
+        TimelineEventShieldState, TimelineEventShieldStateCode, TimelineItemContent,
     },
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     latest_event::{LatestEventValue, LatestEventValueLocalState},

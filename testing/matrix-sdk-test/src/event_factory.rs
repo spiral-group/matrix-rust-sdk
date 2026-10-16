@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: builders for a left call membership and
+// a membership's created_ts.
 
 #![allow(missing_docs)]
 
@@ -1513,6 +1516,18 @@ impl EventFactory {
             .state_key(CallMemberStateKey::new(user_id, device_id.into(), true).as_ref())
     }
 
+    /// Creates an empty (left) rtc membership state event.
+    pub fn call_membership_left_state(
+        &self,
+        user_id: OwnedUserId,
+        device_id: String,
+    ) -> EventBuilder<CallMemberEventContent> {
+        let event = self.event(CallMemberEventContent::new_empty(None));
+        event
+            .sender(&user_id)
+            .state_key(CallMemberStateKey::new(user_id, device_id.into(), true).as_ref())
+    }
+
     /// Create a new `m.direct` global account data event.
     pub fn direct(&self) -> EventBuilder<DirectEventContent> {
         self.global_account_data(DirectEventContent::default())
@@ -1837,6 +1852,16 @@ impl EventBuilder<CallMemberEventContent> {
                 Application::Call(CallApplicationContent::new(call_id, scope));
         } else {
             panic!("application() called on a non-SessionContent call member event");
+        }
+        self
+    }
+
+    /// Sets the membership's `created_ts`, from which its expiry counts.
+    pub fn created_ts(mut self, created_ts: MilliSecondsSinceUnixEpoch) -> Self {
+        if let CallMemberEventContent::SessionContent(session_data) = &mut self.content {
+            session_data.created_ts = Some(created_ts);
+        } else {
+            panic!("created_ts() called on a non-SessionContent call member event");
         }
         self
     }

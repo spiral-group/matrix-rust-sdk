@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified by the Spiral authors, 2026: a call notification's type, lifetime
+// and outcome (RtcCallOutcome).
 
 use std::collections::HashMap;
 
@@ -45,6 +48,9 @@ impl From<matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent 
                 call_intent,
                 declined_by: declinations,
                 active_call_info,
+                notification_type,
+                lifetime_ms,
+                outcome,
             } => TimelineItemContent::RtcNotification {
                 // if the call is active use the live intent
                 call_intent: active_call_info
@@ -65,6 +71,9 @@ impl From<matrix_sdk_ui::timeline::TimelineItemContent> for TimelineItemContent 
                 call_start_ts_millis: active_call_info
                     .and_then(|a| a.call_started_ts_millis)
                     .map(|it| it.0.into()),
+                notification_type: notification_type.map(|n| n.to_string()),
+                lifetime_ms,
+                outcome: outcome.into(),
             },
             Content::MembershipChange(membership) => {
                 let reason = match membership.content() {
@@ -189,6 +198,13 @@ pub enum TimelineItemContent {
         active_members: Vec<String>,
         call_start_ts_millis: Option<u64>,
         is_joined: bool,
+        /// MSC4075 `notification_type` (`ring` / `notification`), verbatim.
+        notification_type: Option<String>,
+        /// MSC4075 `lifetime` in milliseconds; the ring expires at the
+        /// event timestamp plus this value.
+        lifetime_ms: Option<u64>,
+        /// What happened to the call this notification rang for (Spiral).
+        outcome: RtcCallOutcome,
     },
     RoomMembership {
         user_id: String,
@@ -215,6 +231,42 @@ pub enum TimelineItemContent {
         state_key: String,
         error: String,
     },
+}
+
+/// What happened to the call an `m.rtc.notification` rang for (Spiral),
+/// from the call membership events in the timeline, by server timestamp.
+/// The same whatever order the events were loaded in.
+#[derive(Clone, uniffi::Record)]
+pub struct RtcCallOutcome {
+    /// Users other than the sender who joined within the ring window (the
+    /// notification's lifetime, at most 90 s): who answered. In joining
+    /// order.
+    pub answered_by: Vec<String>,
+    /// When the first of them joined, in ms since the epoch.
+    pub answered_ts_millis: Option<u64>,
+    /// Everyone who joined the call, the sender included, with no ring
+    /// window. In joining order.
+    pub joined_by: Vec<String>,
+    /// When someone other than the sender first joined, ring window or not.
+    pub first_joined_ts_millis: Option<u64>,
+    /// Whether this timeline's user joined the call.
+    pub own_user_joined: bool,
+    /// The last membership departure during the call: when it ended, once
+    /// it has.
+    pub ended_ts_millis: Option<u64>,
+}
+
+impl From<matrix_sdk_ui::timeline::RtcCallOutcome> for RtcCallOutcome {
+    fn from(outcome: matrix_sdk_ui::timeline::RtcCallOutcome) -> Self {
+        Self {
+            answered_by: outcome.answered_by.iter().map(|u| u.to_string()).collect(),
+            answered_ts_millis: outcome.answered_at.map(|ts| ts.0.into()),
+            joined_by: outcome.joined_by.iter().map(|u| u.to_string()).collect(),
+            first_joined_ts_millis: outcome.first_joined_at.map(|ts| ts.0.into()),
+            own_user_joined: outcome.own_user_joined,
+            ended_ts_millis: outcome.ended_at.map(|ts| ts.0.into()),
+        }
+    }
 }
 
 #[derive(Clone, uniffi::Record)]
