@@ -21,10 +21,16 @@ use std::{
 };
 
 use once_cell::sync::OnceCell;
-use ruma::{EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
+use ruma::{
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, UInt,
+};
 use tantivy::{
-    Index, IndexReader, TantivyDocument, collector::TopDocs, directory::error::OpenDirectoryError,
-    query::QueryParser, schema::Value,
+    DateTime, Index, IndexReader, Order, ReloadPolicy, TantivyDocument,
+    collector::{Count, MultiCollector, TopDocs},
+    directory::error::OpenDirectoryError,
+    merge_policy::LogMergePolicy,
+    query::QueryParser,
+    schema::Value,
 };
 use tracing::{debug, error, warn};
 
@@ -35,23 +41,88 @@ use crate::{
     writer::SearchIndexWriter,
 };
 
+/// The result type for a search operation.
+#[derive(Debug)]
+pub struct SearchResult {
+    /// The total count of search results that were found.
+    ///
+    /// Might be bigger than the length of [`SearchResult::events`] as the
+    /// search is paginated.
+    pub total_count: usize,
+
+    /// A list of search results.
+    ///
+    /// Each entry contains the timestamp and the ID of the event that matched
+    /// the search query, newest first. The list may be incomplete because the
+    /// search results are paginated; use [`SearchResult::total_count`] to
+    /// determine the total number of matching results.
+    pub events: Vec<(MilliSecondsSinceUnixEpoch, OwnedEventId)>,
+}
+
 /// The subset of an event's data required to index it and later retrieve it.
 ///
 /// Produced by the matrix-sdk layer, which knows how to extract searchable text
 /// from each event type. This crate stays agnostic to Matrix event content.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IndexableEvent {
     /// The event's own id (primary key).
-    pub event_id: OwnedEventId,
+    pub(crate) event_id: OwnedEventId,
     /// The id used as the deletion key: the original event id for edits,
     /// otherwise the event's own id.
-    pub original_event_id: OwnedEventId,
+    pub(crate) original_event_id: OwnedEventId,
     /// The sender of the event.
-    pub sender: OwnedUserId,
+    pub(crate) sender: OwnedUserId,
     /// The origin server timestamp of the event.
-    pub timestamp: MilliSecondsSinceUnixEpoch,
+    ///
+    /// Please use the `matrix_sdk_common::TimelineEvent::timestamp` as much as
+    /// possible as it protects against malformed `origin_server_ts`. At worst,
+    /// use the `matrix_sdk_common::serde_helpers::extract_timestamp` function.
+    pub(crate) timestamp: Option<MilliSecondsSinceUnixEpoch>,
     /// The text to index for this event.
-    pub body: String,
+    pub(crate) body: String,
+}
+
+impl fmt::Debug for IndexableEvent {
+    /// Don't log bodies
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexableEvent")
+            .field("event_id", &self.event_id)
+            .field("original_event_id", &self.original_event_id)
+            .field("sender", &self.sender)
+            .field("timestamp", &self.timestamp)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Maximum value for the timestamp to not overflow when converted to
+/// nanoseconds by Tantivy. See [`IndexableEvent::new`] to learn more.
+const MAX_MILLISECONDS: u64 = (i64::MAX / 1_000_000).cast_unsigned();
+
+impl IndexableEvent {
+    /// Create a new [`IndexableEvent`].
+    pub fn new(
+        event_id: OwnedEventId,
+        original_event_id: OwnedEventId,
+        sender: OwnedUserId,
+        mut timestamp: Option<MilliSecondsSinceUnixEpoch>,
+        body: String,
+    ) -> Self {
+        // Tantivy will transform the number of milliseconds to nanoseconds by
+        // multiplying by 1_000_000 ([1]). If the number of milliseconds is too
+        // big, the multiplication will overflow.
+        //
+        // To avoid this panic, we cap the number of milliseconds to a maximum
+        // value.
+        //
+        // [1]: https://github.com/quickwit-oss/tantivy/blob/31ca1a8ba290b425f871d2e2384592045ec01b8d/common/src/datetime.rs#L62-L67
+        if let Some(timestamp) = &mut timestamp {
+            *timestamp = MilliSecondsSinceUnixEpoch(
+                timestamp.get().min(UInt::new_saturating(MAX_MILLISECONDS)),
+            );
+        }
+
+        Self { event_id, original_event_id, sender, timestamp, body }
+    }
 }
 
 /// A struct to represent the operations on a [`RoomIndex`]
@@ -63,15 +134,15 @@ pub enum RoomIndexOperation {
     /// `MatrixSearchIndexSchema::deletion_key()` matches this event id.
     Remove(OwnedEventId),
     /// Replace all documents in the index where
-    /// `MatrixSearchIndexSchema::deletion_key()` matches this event id with
-    /// the new event.
+    /// `MatrixSearchIndexSchema::deletion_key()` matches this event id with the
+    /// new event.
     Edit(OwnedEventId, IndexableEvent),
     /// Do nothing.
     Noop,
 }
 
-/// A struct that holds all data pertaining to a particular room's
-/// message index.
+/// A struct that holds all data pertaining to a particular room's message
+/// index.
 pub struct RoomIndex {
     index: Index,
     schema: RoomMessageSchema,
@@ -114,14 +185,38 @@ impl RoomIndex {
     }
 
     /// Get a [`SearchIndexWriter`] for this index.
+    ///
+    /// Every commit creates a segment, and opening an index opens every file of
+    /// every segment, which dominates the cost of opening many room indexes.
+    /// Merge as soon as there are two segments of the same layer, so a room
+    /// index usually stays at a single segment.
     fn writer(&self) -> Result<SearchIndexWriter, IndexError> {
         let writer = self.index.writer(TANTIVY_INDEX_MEMORY_BUDGET)?;
+
+        let mut merge_policy = LogMergePolicy::default();
+        merge_policy.set_min_num_segments(2);
+        writer.set_merge_policy(Box::new(merge_policy));
+
         Ok(SearchIndexWriter::new(writer, self.schema.clone()))
     }
 
     /// Get or create the cached [`IndexReader`] for this index.
+    ///
+    /// The reload policy is [`ReloadPolicy::Manual`]: we are the only writer of
+    /// this index, and every commit goes through
+    /// [`RoomIndex::commit_and_reload`], which reloads explicitly. Tantivy's
+    /// default policy would instead spawn one meta file watcher thread per
+    /// index, i.e. one per room, and panics if that thread cannot be spawned.
     fn reader(&self) -> Result<&IndexReader, IndexError> {
-        self.reader.get_or_try_init(|| Ok(self.index.reader_builder().try_into()?))
+        self.reader.get_or_try_init(|| {
+            Ok(self.index.reader_builder().reload_policy(ReloadPolicy::Manual).try_into()?)
+        })
+    }
+
+    /// Do the costly part of opening this index ahead of the first search, i.e.
+    /// opening all its segments.
+    pub fn warm_up(&self) -> Result<(), IndexError> {
+        self.reader().map(|_| ())
     }
 
     /// Commit added events to [`RoomIndex`]. The changes are not reflected in
@@ -135,16 +230,15 @@ impl RoomIndex {
         Ok(last_commit_opstamp)
     }
 
-    /// Commit added events to [`RoomIndex`] and
-    /// update searchers so that they reflect the state of the last
-    /// `.commit()`.
+    /// Commit added events to [`RoomIndex`] and update searchers so that they
+    /// reflect the state of the last `.commit()`.
     ///
     /// Every commit should be rapidly reflected on your `IndexReader` and you
     /// should not need to call `reload()` at all.
     ///
     /// This automatic reload can take 10s of milliseconds to kick in however,
-    /// and in unit tests it can be nice to deterministically force the
-    /// reload of searchers.
+    /// and in unit tests it can be nice to deterministically force the reload
+    /// of searchers.
     fn commit_and_reload(&mut self, writer: &mut SearchIndexWriter) -> Result<OpStamp, IndexError> {
         debug!(
             "RoomIndex: committing and reloading: uncommitted: {:?}, {:?}",
@@ -155,43 +249,54 @@ impl RoomIndex {
         Ok(last_commit_opstamp)
     }
 
-    /// Search the [`RoomIndex`] for some query. Returns a list of
-    /// results with a maximum given length. If `pagination_offset` is
-    /// set then the results will start there, i.e.
+    /// Search the [`RoomIndex`] for some query. Returns a list of results with
+    /// a maximum given length. If `pagination_offset` is set then the results
+    /// will start there, i.e.
     ///
-    /// if `max_number_of_results = 3` and `pagination_offset = 10`
-    /// (and there are a surplus of results)
-    /// then this will return results `11, 12, 13`
+    /// if `max_number_of_results = 3` and `pagination_offset = 10` (and there
+    /// are a surplus of results) then this will return results `11, 12, 13`
     pub fn search(
         &self,
         query: &str,
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+    ) -> Result<SearchResult, IndexError> {
         let query = self.query_parser.parse_query(query)?;
         let searcher = self.reader()?.searcher();
 
         let offset = pagination_offset.unwrap_or(0);
 
-        let results = searcher.search(
-            &query,
-            &TopDocs::with_limit(max_number_of_results).and_offset(offset).order_by_score(),
-        )?;
-        let mut ret: Vec<(f32, OwnedEventId)> = Vec::new();
+        let top_docs = TopDocs::with_limit(max_number_of_results)
+            .and_offset(offset)
+            .order_by_fast_field::<DateTime>("date", Order::Desc);
+
+        let mut multi = MultiCollector::new();
+        let count_handle = multi.add_collector(Count);
+        let top_docs_handle = multi.add_collector(top_docs);
+
+        let mut results = searcher.search(&query, &multi)?;
+        let mut ret: Vec<(MilliSecondsSinceUnixEpoch, OwnedEventId)> = Vec::new();
         let pk = self.schema.primary_key();
 
-        for (score, doc_address) in results {
+        let result_count = count_handle.extract(&mut results);
+
+        for (date, doc_address) in top_docs_handle.extract(&mut results) {
+            // Timestamps are indexed from a `MilliSecondsSinceUnixEpoch`, so
+            // they are never negative.
+            let timestamp = MilliSecondsSinceUnixEpoch(UInt::new_saturating(
+                date.map_or(0, DateTime::into_timestamp_millis).cast_unsigned(),
+            ));
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             match retrieved_doc.get_first(pk).and_then(|maybe_value| maybe_value.as_str()) {
                 Some(value) => match OwnedEventId::try_from(value) {
-                    Ok(event_id) => ret.push((score, event_id)),
+                    Ok(event_id) => ret.push((timestamp, event_id)),
                     Err(err) => error!("error while parsing event_id from search result: {err:?}"),
                 },
                 _ => error!("unexpected value type while searching documents"),
             }
         }
 
-        Ok(ret)
+        Ok(SearchResult { total_count: result_count, events: ret })
     }
 
     fn events_to_be_removed(&self, event_id: &EventId) -> Result<Vec<OwnedEventId>, IndexError> {
@@ -205,6 +310,7 @@ impl RoomIndex {
                 10000,
                 None,
             )?
+            .events
             .into_iter()
             .map(|(_, id)| id)
             .collect())
@@ -238,10 +344,10 @@ impl RoomIndex {
             self.uncommitted_removes.insert(event);
         }
 
-        // Uncommitted documents added in this same batch also get deleted by the
-        // term above, so reconcile them too. Otherwise `contains` would still
-        // report them as present and a subsequent re-add (e.g. from an edit)
-        // would be wrongly skipped, leaving the document deleted.
+        // Uncommitted documents added in this same batch also get deleted by
+        // the term above, so reconcile them too. Otherwise `contains` would
+        // still report them as present and a subsequent re-add (e.g. from an
+        // edit) would be wrongly skipped, leaving the document deleted.
         let uncommitted: Vec<_> = self
             .uncommitted_adds
             .iter()
@@ -342,6 +448,9 @@ impl RoomIndex {
     ///
     /// This which will add/remove/edit an events in the index based on the
     /// operations.
+    ///
+    /// Waits for background merge threads to prevent racing with subsequent
+    /// calls.
     pub fn bulk_execute(&mut self, operations: Vec<RoomIndexOperation>) -> Result<(), IndexError> {
         let mut writer = self.writer()?;
         let mut operations = operations.into_iter();
@@ -353,6 +462,7 @@ impl RoomIndex {
         }
 
         self.commit_and_reload(&mut writer)?;
+        writer.wait_merging_threads()?;
 
         Ok(())
     }
@@ -367,7 +477,7 @@ impl RoomIndex {
         match search_result {
             Ok(results) => {
                 !self.uncommitted_removes.contains(event_id)
-                    && (!results.is_empty() || self.uncommitted_adds.contains_key(event_id))
+                    && (!results.events.is_empty() || self.uncommitted_adds.contains_key(event_id))
             }
             Err(err) => {
                 warn!("Failed to check if event has been indexed, assuming it has: {err}");
@@ -394,10 +504,11 @@ mod tests {
         room_id, user_id,
     };
 
-    use crate::{
-        error::IndexError,
-        index::{IndexableEvent, RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
+    use super::{
+        IndexableEvent, MAX_MILLISECONDS, MilliSecondsSinceUnixEpoch, RoomIndex,
+        RoomIndexOperation, UInt, builder::RoomIndexBuilder,
     };
+    use crate::error::IndexError;
 
     /// Build an [`IndexableEvent`] from a text room message (tests only handle
     /// text).
@@ -409,19 +520,21 @@ mod tests {
             Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
             _ => event.event_id.clone(),
         };
-        IndexableEvent {
-            event_id: event.event_id.clone(),
+
+        IndexableEvent::new(
+            event.event_id.clone(),
             original_event_id,
-            sender: event.sender.clone(),
-            timestamp: event.origin_server_ts,
-            body: content.body.clone(),
-        }
+            event.sender.clone(),
+            Some(event.origin_server_ts),
+            content.body.clone(),
+        )
     }
 
     /// Helper function to add a regular message to the index
     ///
     /// # Panic
-    /// Panics when event is not a [`OriginalSyncRoomMessageEvent`] with no
+    ///
+    /// Panics when event is not an [`OriginalSyncRoomMessageEvent`] with no
     /// relations.
     fn index_message(
         index: &mut RoomIndex,
@@ -464,7 +577,143 @@ mod tests {
             .sender(user_id!("@user_id:localhost"))
             .into_any_sync_message_like_event();
 
-        index_message(&mut index, event).expect("failed to add event: {res:?}");
+        index_message(&mut index, event).expect("failed to add event");
+    }
+
+    #[test]
+    fn test_encrypted_index_is_recreated_with_another_key() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let room_id = room_id!("!r");
+        let add = RoomIndexOperation::Add(IndexableEvent::new(
+            event_id!("$ev").to_owned(),
+            event_id!("$ev").to_owned(),
+            user_id!("@mnt_io:matrix.org").to_owned(),
+            None,
+            "body".to_owned(),
+        ));
+
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .encrypted("key")
+            .build()
+            .unwrap();
+        index.execute(add).unwrap();
+        assert_eq!(index.search("body", 10, None).unwrap().events.len(), 1);
+        drop(index);
+
+        // The index can't be decrypted with another key, so it's
+        // recreated, empty.
+        let index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id)
+            .encrypted("another key")
+            .build()
+            .unwrap();
+        assert!(index.search("body", 10, None).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn test_commits_are_merged_into_a_single_segment() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let mut index = RoomIndexBuilder::new_on_disk(tmpdir.path().to_path_buf(), room_id!("!r"))
+            .unencrypted()
+            .build()
+            .unwrap();
+
+        for nth in 0..10 {
+            let event_id = EventId::parse(format!("$ev{nth}")).unwrap();
+            index
+                .bulk_execute(vec![RoomIndexOperation::Add(IndexableEvent::new(
+                    event_id.clone(),
+                    event_id,
+                    user_id!("@mnt_io:matrix.org").to_owned(),
+                    None,
+                    "body".to_owned(),
+                ))])
+                .unwrap();
+        }
+
+        assert_eq!(index.index.searchable_segment_ids().unwrap().len(), 1);
+        assert_eq!(index.search("body", 100, None).unwrap().events.len(), 10);
+    }
+
+    #[test]
+    fn test_add_event_with_no_timestamp() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!r")).build();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$ev").to_owned(),
+                event_id!("$ev").to_owned(),
+                user_id!("@mnt_io:matrix.org").to_owned(),
+                None,
+                "body".to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_add_event_with_raw_malformed_timestamp_must_not_panic() {
+        let mut index = RoomIndexBuilder::new_in_memory(room_id!("!r")).build();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event_id!("$ev").to_owned(),
+                event_id!("$ev").to_owned(),
+                user_id!("@mnt_io:matrix.org").to_owned(),
+                Some(MilliSecondsSinceUnixEpoch(UInt::new(151393755000000).unwrap())),
+                "body".to_owned(),
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_add_event_with_malformed_timestamp_must_not_panic() {
+        let room_id = room_id!("!r");
+        let mut index = RoomIndexBuilder::new_in_memory(room_id).build();
+
+        let body = "body".to_owned();
+        let event = EventFactory::new()
+            .server_ts(151393755000000)
+            .text_msg(body.clone())
+            .event_id(event_id!("$ev"))
+            .room(room_id)
+            .sender(user_id!("@mnt_io:matrix.org"))
+            .into_event();
+
+        index
+            .execute(RoomIndexOperation::Add(IndexableEvent::new(
+                event.event_id().unwrap().to_owned(),
+                event.event_id().unwrap().to_owned(),
+                event.sender().unwrap(),
+                event.timestamp(),
+                body,
+            )))
+            .expect("failed to add event");
+    }
+
+    #[test]
+    fn test_indexable_event_timestamp_is_capped() {
+        let event_id = event_id!("$ev").to_owned();
+        let sender = user_id!("@mnt_io:matrix.org").to_owned();
+        let body = "body".to_owned();
+
+        // Not capped.
+        let event = IndexableEvent::new(
+            event_id.clone(),
+            event_id.clone(),
+            sender.clone(),
+            Some(MilliSecondsSinceUnixEpoch(UInt::new(MAX_MILLISECONDS).unwrap())),
+            body.clone(),
+        );
+        assert_eq!(event.timestamp.unwrap().get(), UInt::new(MAX_MILLISECONDS).unwrap());
+
+        // Capped!
+        let event = IndexableEvent::new(
+            event_id.clone(),
+            event_id,
+            sender,
+            Some(MilliSecondsSinceUnixEpoch(UInt::new(MAX_MILLISECONDS + 42).unwrap())),
+            body,
+        );
+        assert_eq!(event.timestamp.unwrap().get(), UInt::new(MAX_MILLISECONDS).unwrap());
     }
 
     #[test]
@@ -498,7 +747,7 @@ mod tests {
         )?;
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
-        let result: HashSet<_> = result.iter().map(|(_, id)| id).collect();
+        let result: HashSet<_> = result.events.iter().map(|(_, id)| id).collect();
 
         let true_value = [event_id_1.to_owned(), event_id_3.to_owned()];
         let true_value: HashSet<_> = true_value.iter().collect();
@@ -515,7 +764,7 @@ mod tests {
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
 
-        assert!(result.is_empty(), "search result not empty: {result:?}");
+        assert!(result.events.is_empty(), "search result not empty: {result:?}");
 
         Ok(())
     }
@@ -574,7 +823,7 @@ mod tests {
 
         let result = index.search("sentence", 10, None).expect("search failed with: {result:?}");
 
-        assert_eq!(result.len(), 1, "Index should have ignored second indexing");
+        assert_eq!(result.events.len(), 1, "Index should have ignored second indexing");
 
         Ok(())
     }
@@ -659,8 +908,8 @@ mod tests {
         let edit = to_indexable(&edit);
 
         // An original and its edit arriving in the same batch produce an `Add`
-        // and an `Edit` of the same document. The `Edit`'s removal must not drop
-        // the document added earlier in the same uncommitted batch.
+        // and an `Edit` of the same document. The `Edit`'s removal must not
+        // drop the document added earlier in the same uncommitted batch.
         index.bulk_execute(vec![
             RoomIndexOperation::Add(edit.clone()),
             RoomIndexOperation::Edit(original_id.to_owned(), edit),
@@ -669,8 +918,13 @@ mod tests {
         assert!(index.contains(edit_id), "Edited document should be indexed");
 
         let result = index.search("sentence", 10, None)?;
-        assert_eq!(result.len(), 1, "Search should find the edited document, got {result:?}");
-        assert_eq!(result[0].1, edit_id, "unexpected event id: {result:?}");
+        assert_eq!(result.total_count, 1, "Search should return the total count of results it got");
+        assert_eq!(
+            result.events.len(),
+            1,
+            "Search should find the edited document, got {result:?}"
+        );
+        assert_eq!(result.events[0].1, edit_id, "unexpected event id: {result:?}");
 
         Ok(())
     }

@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use assert_matches2::assert_let;
 use ruma::owned_room_id;
 use serde_json::{Value as JsonValue, json};
+use strass::assert_let;
 
 use super::WIDGET_ID;
 use crate::widget::machine::{Action, IncomingMessage, WidgetMachine};
@@ -52,6 +52,8 @@ fn test_get_supported_api_versions() {
                     "org.matrix.msc2871",
                     "org.matrix.msc3819",
                     "org.matrix.msc4039",
+                    "org.matrix.msc4515",
+                    "org.matrix.msc4533",
                 ]
             },
         }),

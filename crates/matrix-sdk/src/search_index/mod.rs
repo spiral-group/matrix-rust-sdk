@@ -16,18 +16,26 @@
 //! matrix-sdk-search crate. It provides a [`SearchIndex`] which wraps
 //! multiple [`RoomIndex`].
 
-use std::{collections::hash_map::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::hash_map::HashMap,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread::available_parallelism,
+};
 
-use futures_util::future::join_all;
+use futures_util::{StreamExt as _, future::join_all, stream};
 use matrix_sdk_base::{
     check_validity_of_replacement_events, deserialized_responses::TimelineEvent,
 };
 use matrix_sdk_search::{
     error::IndexError,
-    index::{IndexableEvent, RoomIndex, RoomIndexOperation, builder::RoomIndexBuilder},
+    index::{
+        IndexableEvent, RoomIndex, RoomIndexOperation, SearchResult, builder::RoomIndexBuilder,
+    },
 };
 use ruma::{
-    EventId, OwnedEventId, OwnedRoomId, RoomId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId,
     events::{
         AnySyncMessageLikeEvent, AnySyncTimelineEvent,
         poll::{
@@ -42,20 +50,23 @@ use ruma::{
     },
     room_version_rules::RedactionRules,
 };
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::{
+    sync::{Mutex, MutexGuard},
+    task::spawn_blocking,
+};
 use tracing::{debug, warn};
 
 use crate::event_cache::RoomEventCache;
 
-type Password = String;
+type Key = String;
 
 /// Type of location to store [`RoomIndex`]
 #[derive(Clone, Debug)]
 pub enum SearchIndexStoreKind {
     /// Store unencrypted in file system folder
     UnencryptedDirectory(PathBuf),
-    /// Store encrypted in file system folder
-    EncryptedDirectory(PathBuf, Password),
+    /// Store encrypted, with the given high-entropy key, in file system folder
+    EncryptedDirectory(PathBuf, Key),
     /// Store in memory
     InMemory,
 }
@@ -79,12 +90,93 @@ impl SearchIndex {
         Self { room_indexes, search_index_store_kind }
     }
 
+    /// The directory the room indexes are stored in, if they are stored on
+    /// disk.
+    pub(crate) fn directory(&self) -> Option<&Path> {
+        match &self.search_index_store_kind {
+            SearchIndexStoreKind::UnencryptedDirectory(path)
+            | SearchIndexStoreKind::EncryptedDirectory(path, _) => Some(path),
+            SearchIndexStoreKind::InMemory => None,
+        }
+    }
+
+    /// The disk size of the room indexes, if they are stored on disk.
+    pub(crate) fn size(&self) -> Option<usize> {
+        fn dir_size(path: &Path) -> std::io::Result<u64> {
+            let mut size = 0;
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                size += if metadata.is_dir() { dir_size(&entry.path())? } else { metadata.len() };
+            }
+            Ok(size)
+        }
+
+        let size = dir_size(self.directory()?).ok()?;
+        usize::try_from(size).ok()
+    }
+
     /// Acquire [`SearchIndexGuard`] for this [`SearchIndex`].
     pub async fn lock(&self) -> SearchIndexGuard<'_> {
         SearchIndexGuard {
             index_map: self.room_indexes.lock().await,
             search_index_store_kind: &self.search_index_store_kind,
         }
+    }
+
+    /// Open the indexes of the given rooms that exist on disk but aren't open
+    /// yet, concurrently and without holding the lock, instead of one by one
+    /// when they are first searched.
+    pub(crate) async fn open_indexes(&self, room_ids: impl Iterator<Item = OwnedRoomId>) {
+        let to_open: Vec<_> = {
+            let guard = self.lock().await;
+            room_ids
+                .filter(|room_id| {
+                    !guard.index_map.contains_key(room_id) && guard.has_index(room_id)
+                })
+                .collect()
+        };
+
+        let concurrency = available_parallelism().map_or(1, NonZeroUsize::get);
+
+        let mut opened = stream::iter(to_open)
+            .map(|room_id| {
+                let store_kind = self.search_index_store_kind.clone();
+                spawn_blocking(move || {
+                    let index = create_index(&store_kind, &room_id)
+                        .and_then(|index| index.warm_up().map(|()| index));
+                    (room_id, index)
+                })
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(task) = opened.next().await {
+            match task.expect("Task join error") {
+                // Keep the index opened meanwhile by the indexer, if any.
+                (room_id, Ok(index)) => {
+                    self.room_indexes.lock().await.entry(room_id).or_insert(index);
+                }
+                // The search will try again and report the error.
+                (room_id, Err(err)) => warn!(%room_id, "Failed to open the search index: {err}"),
+            }
+        }
+    }
+
+    /// Same as [`SearchIndexGuard::bulk_handle_timeline_event`], but only
+    /// locks the index once the events are parsed: parsing waits on the event
+    /// cache, and searches need the lock meanwhile.
+    pub(crate) async fn bulk_handle_timeline_event<T>(
+        &self,
+        events: T,
+        room_cache: &RoomEventCache,
+        room_id: &RoomId,
+        redaction_rules: &RedactionRules,
+    ) -> Result<(), IndexError>
+    where
+        T: Iterator<Item = TimelineEvent>,
+    {
+        let operations = parse_timeline_events(events, room_cache, redaction_rules).await;
+        self.lock().await.bulk_execute(operations, room_id)
     }
 }
 
@@ -98,27 +190,28 @@ pub struct SearchIndexGuard<'a> {
     search_index_store_kind: &'a SearchIndexStoreKind,
 }
 
-impl SearchIndexGuard<'_> {
-    fn create_index(&self, room_id: &RoomId) -> Result<RoomIndex, IndexError> {
-        let index = match self.search_index_store_kind {
-            SearchIndexStoreKind::UnencryptedDirectory(path) => {
-                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).unencrypted().build()?
-            }
-            SearchIndexStoreKind::EncryptedDirectory(path, password) => {
-                RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id)
-                    .encrypted(password)
-                    .build()?
-            }
-            SearchIndexStoreKind::InMemory => RoomIndexBuilder::new_in_memory(room_id).build(),
-        };
-        Ok(index)
-    }
+fn create_index(
+    search_index_store_kind: &SearchIndexStoreKind,
+    room_id: &RoomId,
+) -> Result<RoomIndex, IndexError> {
+    let index = match search_index_store_kind {
+        SearchIndexStoreKind::UnencryptedDirectory(path) => {
+            RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).unencrypted().build()?
+        }
+        SearchIndexStoreKind::EncryptedDirectory(path, key) => {
+            RoomIndexBuilder::new_on_disk(path.to_path_buf(), room_id).encrypted(key).build()?
+        }
+        SearchIndexStoreKind::InMemory => RoomIndexBuilder::new_in_memory(room_id).build(),
+    };
+    Ok(index)
+}
 
+impl SearchIndexGuard<'_> {
     /// Handle a [`RoomIndexOperation`] in the [`RoomIndex`] of a given
     /// [`RoomId`]
     ///
-    /// This which will add/remove/edit an event in the index based on the
-    /// event type.
+    /// This which will add/remove/edit an event in the index based on the event
+    /// type.
     ///
     /// Prefer [`SearchIndexGuard::bulk_execute`] for multiple operations.
     pub(crate) fn execute(
@@ -127,7 +220,7 @@ impl SearchIndexGuard<'_> {
         room_id: &RoomId,
     ) -> Result<(), IndexError> {
         if !self.index_map.contains_key(room_id) {
-            let index = self.create_index(room_id)?;
+            let index = create_index(self.search_index_store_kind, room_id)?;
             self.index_map.insert(room_id.to_owned(), index);
         }
 
@@ -136,18 +229,35 @@ impl SearchIndexGuard<'_> {
         index.execute(operation)
     }
 
+    /// Whether a [`RoomIndex`] exists for this room, in memory or on disk.
+    fn has_index(&self, room_id: &RoomId) -> bool {
+        self.index_map.contains_key(room_id)
+            || match self.search_index_store_kind {
+                SearchIndexStoreKind::UnencryptedDirectory(path)
+                | SearchIndexStoreKind::EncryptedDirectory(path, _) => {
+                    path.join(room_id.as_str()).exists()
+                }
+                SearchIndexStoreKind::InMemory => false,
+            }
+    }
+
     /// Handle a [`RoomIndexOperation`] in the [`RoomIndex`] of a given
     /// [`RoomId`]
     ///
-    /// This which will add/remove/edit an event in the index based on the
-    /// event type.
+    /// This which will add/remove/edit an event in the index based on the event
+    /// type.
     pub(crate) fn bulk_execute(
         &mut self,
         operations: Vec<RoomIndexOperation>,
         room_id: &RoomId,
     ) -> Result<(), IndexError> {
+        // Don't create an index (which is costly) for nothing.
+        if operations.is_empty() {
+            return Ok(());
+        }
+
         if !self.index_map.contains_key(room_id) {
-            let index = self.create_index(room_id)?;
+            let index = create_index(self.search_index_store_kind, room_id)?;
             self.index_map.insert(room_id.to_owned(), index);
         }
 
@@ -164,9 +274,15 @@ impl SearchIndexGuard<'_> {
         max_number_of_results: usize,
         pagination_offset: Option<usize>,
         room_id: &RoomId,
-    ) -> Result<Vec<(f32, OwnedEventId)>, IndexError> {
+    ) -> Result<SearchResult, IndexError> {
+        // Nothing was ever indexed for this room: don't create an index (which
+        // is costly) only to find it empty.
+        if !self.has_index(room_id) {
+            return Ok(SearchResult { total_count: 0, events: Vec::new() });
+        }
+
         if !self.index_map.contains_key(room_id) {
-            let index = self.create_index(room_id)?;
+            let index = create_index(self.search_index_store_kind, room_id)?;
             self.index_map.insert(room_id.to_owned(), index);
         }
 
@@ -209,12 +325,19 @@ impl SearchIndexGuard<'_> {
     where
         T: Iterator<Item = TimelineEvent>,
     {
-        let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
-
-        let operations: Vec<_> = join_all(futures).await.into_iter().flatten().collect();
-
+        let operations = parse_timeline_events(events, room_cache, redaction_rules).await;
         self.bulk_execute(operations, room_id)
     }
+}
+
+/// Derive the [`RoomIndexOperation`]s to execute for the given events.
+async fn parse_timeline_events(
+    events: impl Iterator<Item = TimelineEvent>,
+    room_cache: &RoomEventCache,
+    redaction_rules: &RedactionRules,
+) -> Vec<RoomIndexOperation> {
+    let futures = events.map(|ev| parse_timeline_event(room_cache, ev, redaction_rules));
+    join_all(futures).await.into_iter().flatten().collect()
 }
 
 /// Given an event id this function returns the most recent edit on said event
@@ -284,19 +407,23 @@ fn room_message_body(msgtype: &MessageType) -> Option<String> {
 
 /// Build an [`IndexableEvent`] from a room message, or `None` if its type
 /// carries no searchable text.
-fn indexable_from_room_message(event: &OriginalSyncRoomMessageEvent) -> Option<IndexableEvent> {
+fn indexable_from_room_message(
+    event: &OriginalSyncRoomMessageEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
+) -> Option<IndexableEvent> {
     let body = room_message_body(&event.content.msgtype)?;
     let original_event_id = match &event.content.relates_to {
         Some(Relation::Replacement(replacement)) => replacement.event_id.clone(),
         _ => event.event_id.clone(),
     };
-    Some(IndexableEvent {
-        event_id: event.event_id.clone(),
+
+    Some(IndexableEvent::new(
+        event.event_id.clone(),
         original_event_id,
-        sender: event.sender.clone(),
-        timestamp: event.origin_server_ts,
+        event.sender.clone(),
+        timestamp,
         body,
-    })
+    ))
 }
 
 /// If the given [`OriginalSyncRoomMessageEvent`] is an edit we make an
@@ -304,12 +431,13 @@ fn indexable_from_room_message(event: &OriginalSyncRoomMessageEvent) -> Option<I
 /// original.
 async fn handle_possible_edit(
     event: &OriginalSyncRoomMessageEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
 ) -> Option<RoomIndexOperation> {
     if let Some(Relation::Replacement(replacement_data)) = &event.content.relates_to {
         if let Some(recent) = get_most_recent_edit(cache, &replacement_data.event_id).await {
             return Some(
-                indexable_from_room_message(&recent).map_or(
+                indexable_from_room_message(&recent, timestamp).map_or(
                     RoomIndexOperation::Noop,
                     |indexable| {
                         RoomIndexOperation::Edit(replacement_data.event_id.clone(), indexable)
@@ -327,15 +455,18 @@ async fn handle_possible_edit(
 /// depending on the message.
 async fn handle_room_message(
     event: SyncRoomMessageEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
 ) -> Option<RoomIndexOperation> {
     if let Some(event) = event.as_original() {
-        return handle_possible_edit(event, cache).await.or(get_most_recent_edit(
+        return handle_possible_edit(event, timestamp, cache).await.or(get_most_recent_edit(
             cache,
             &event.event_id,
         )
         .await
-        .and_then(|recent| indexable_from_room_message(&recent).map(RoomIndexOperation::Add)));
+        .and_then(|recent| {
+            indexable_from_room_message(&recent, timestamp).map(RoomIndexOperation::Add)
+        }));
     }
     None
 }
@@ -344,6 +475,7 @@ async fn handle_room_message(
 /// re-adding the most recent remaining version if an edit was redacted.
 async fn handle_room_redaction(
     event: SyncRoomRedactionEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
     cache: &RoomEventCache,
     rules: &RedactionRules,
 ) -> Option<RoomIndexOperation> {
@@ -356,7 +488,7 @@ async fn handle_room_redaction(
             redacted_event,
         ))) = redacted_event.raw().deserialize()
         && let Some(redacted_event) = redacted_event.as_original()
-        && let Some(operation) = handle_possible_edit(redacted_event, cache).await
+        && let Some(operation) = handle_possible_edit(redacted_event, timestamp, cache).await
     {
         return Some(operation);
     }
@@ -367,15 +499,19 @@ async fn handle_room_redaction(
 }
 
 /// Return a [`RoomIndexOperation::Add`] indexing a sticker's descriptive text.
-fn handle_sticker(event: SyncStickerEvent) -> Option<RoomIndexOperation> {
+fn handle_sticker(
+    event: SyncStickerEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
+) -> Option<RoomIndexOperation> {
     let event = event.as_original()?;
-    Some(RoomIndexOperation::Add(IndexableEvent {
-        event_id: event.event_id.clone(),
-        original_event_id: event.event_id.clone(),
-        sender: event.sender.clone(),
-        timestamp: event.origin_server_ts,
-        body: event.content.body.clone(),
-    }))
+
+    Some(RoomIndexOperation::Add(IndexableEvent::new(
+        event.event_id.clone(),
+        event.event_id.clone(),
+        event.sender.clone(),
+        timestamp,
+        event.content.body.clone(),
+    )))
 }
 
 /// Return a [`RoomIndexOperation::Add`] indexing an unstable poll's question
@@ -384,7 +520,10 @@ fn handle_sticker(event: SyncStickerEvent) -> Option<RoomIndexOperation> {
 /// ponytail: only indexes the initial `New` poll — edits (`Replacement`) and
 /// poll ends are ignored. Add edit handling if editing a poll needs to update
 /// search results.
-fn handle_unstable_poll_start(event: SyncUnstablePollStartEvent) -> Option<RoomIndexOperation> {
+fn handle_unstable_poll_start(
+    event: SyncUnstablePollStartEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
+) -> Option<RoomIndexOperation> {
     let event = event.as_original()?;
 
     let UnstablePollStartEventContent::New(content) = &event.content else {
@@ -398,13 +537,13 @@ fn handle_unstable_poll_start(event: SyncUnstablePollStartEvent) -> Option<RoomI
         body.push_str(&answer.text);
     }
 
-    Some(RoomIndexOperation::Add(IndexableEvent {
-        event_id: event.event_id.clone(),
-        original_event_id: event.event_id.clone(),
-        sender: event.sender.clone(),
-        timestamp: event.origin_server_ts,
+    Some(RoomIndexOperation::Add(IndexableEvent::new(
+        event.event_id.clone(),
+        event.event_id.clone(),
+        event.sender.clone(),
+        timestamp,
         body,
-    }))
+    )))
 }
 
 /// Return a [`RoomIndexOperation::Add`] indexing a stable poll's question and
@@ -412,7 +551,10 @@ fn handle_unstable_poll_start(event: SyncUnstablePollStartEvent) -> Option<RoomI
 ///
 /// ponytail: like [`handle_unstable_poll_start`], edits and poll ends are
 /// ignored — only the initial poll is indexed.
-fn handle_poll_start(event: SyncPollStartEvent) -> Option<RoomIndexOperation> {
+fn handle_poll_start(
+    event: SyncPollStartEvent,
+    timestamp: Option<MilliSecondsSinceUnixEpoch>,
+) -> Option<RoomIndexOperation> {
     let event = event.as_original()?;
 
     // Skip poll edits, matching the unstable poll handling.
@@ -429,13 +571,13 @@ fn handle_poll_start(event: SyncPollStartEvent) -> Option<RoomIndexOperation> {
         }
     }
 
-    Some(RoomIndexOperation::Add(IndexableEvent {
-        event_id: event.event_id.clone(),
-        original_event_id: event.event_id.clone(),
-        sender: event.sender.clone(),
-        timestamp: event.origin_server_ts,
+    Some(RoomIndexOperation::Add(IndexableEvent::new(
+        event.event_id.clone(),
+        event.event_id.clone(),
+        event.sender.clone(),
+        timestamp,
         body,
-    }))
+    )))
 }
 
 /// Prepare a [`TimelineEvent`] into a [`RoomIndexOperation`] for search
@@ -451,19 +593,21 @@ async fn parse_timeline_event(
         return None;
     }
 
+    let timestamp = event.timestamp();
+
     match event.raw().deserialize() {
         Ok(event) => match event {
             AnySyncTimelineEvent::MessageLike(event) => match event {
                 AnySyncMessageLikeEvent::RoomMessage(event) => {
-                    handle_room_message(event, cache).await
+                    handle_room_message(event, timestamp, cache).await
                 }
                 AnySyncMessageLikeEvent::RoomRedaction(event) => {
-                    handle_room_redaction(event, cache, redaction_rules).await
+                    handle_room_redaction(event, timestamp, cache, redaction_rules).await
                 }
-                AnySyncMessageLikeEvent::Sticker(event) => handle_sticker(event),
-                AnySyncMessageLikeEvent::PollStart(event) => handle_poll_start(event),
+                AnySyncMessageLikeEvent::Sticker(event) => handle_sticker(event, timestamp),
+                AnySyncMessageLikeEvent::PollStart(event) => handle_poll_start(event, timestamp),
                 AnySyncMessageLikeEvent::UnstablePollStart(event) => {
-                    handle_unstable_poll_start(event)
+                    handle_unstable_poll_start(event, timestamp)
                 }
                 _ => None,
             },
@@ -488,11 +632,76 @@ mod tests {
 
     #[cfg(feature = "experimental-search")]
     #[async_test]
+    async fn test_search_index_size() {
+        use super::SearchIndexStoreKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mock_server = MatrixMockServer::new().await;
+        let client = mock_server
+            .client_builder()
+            .on_builder(|builder| {
+                builder.search_index_store(SearchIndexStoreKind::UnencryptedDirectory(
+                    dir.path().join("search"),
+                ))
+            })
+            .build()
+            .await;
+
+        // Nothing indexed yet: the directory doesn't even exist.
+        assert_eq!(client.get_store_sizes().await.unwrap().search_index, None);
+
+        let room_id = room_id!("!room_id:localhost");
+        mock_server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room_id).add_timeline_event(
+                    EventFactory::new()
+                        .text_msg("this is a sentence")
+                        .room(room_id)
+                        .sender(user_id!("@user_id:localhost")),
+                ),
+            )
+            .await;
+
+        // Let the indexer process the event.
+        for _ in 0..50 {
+            if client.get_store_sizes().await.unwrap().search_index.is_some_and(|size| size > 0) {
+                return;
+            }
+            crate::sleep::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the search index size was never reported");
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
+    async fn test_no_index_is_created_for_nothing() {
+        use super::{SearchIndex, SearchIndexStoreKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let search_index = SearchIndex::new(
+            Default::default(),
+            SearchIndexStoreKind::UnencryptedDirectory(dir.path().to_path_buf()),
+        );
+        let room_id = room_id!("!room_id:localhost");
+        let mut guard = search_index.lock().await;
+
+        // Searching a room that was never indexed finds nothing…
+        let result = guard.search("sentence", 10, None, room_id).unwrap();
+        assert_eq!(result.total_count, 0);
+        assert!(result.events.is_empty());
+
+        // … and so does an empty batch of operations: none creates an index.
+        guard.bulk_execute(Vec::new(), room_id).unwrap();
+
+        assert!(!dir.path().join(room_id.as_str()).exists());
+    }
+
+    #[cfg(feature = "experimental-search")]
+    #[async_test]
     async fn test_sync_message_is_indexed() {
         let mock_server = MatrixMockServer::new().await;
         let client = mock_server.client_builder().build().await;
-
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!room_id:localhost");
         let event_id = event_id!("$event_id:localost");
@@ -514,8 +723,8 @@ mod tests {
 
         let response = room.search("this", 5, None).await.expect("search should have 1 result");
 
-        assert_eq!(response.len(), 1, "unexpected numbers of responses: {response:?}");
-        assert_eq!(response[0].1, event_id, "event id doesn't match: {response:?}");
+        assert_eq!(response.events.len(), 1, "unexpected numbers of responses: {response:?}");
+        assert_eq!(response.events[0].1, event_id, "event id doesn't match: {response:?}");
     }
 
     #[cfg(feature = "experimental-search")]
@@ -525,8 +734,6 @@ mod tests {
 
         let mock_server = MatrixMockServer::new().await;
         let client = mock_server.client_builder().build().await;
-
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!room_id:localhost");
         let image_id = event_id!("$image_id:localhost");
@@ -553,18 +760,26 @@ mod tests {
 
         // The caption is indexed.
         let response = room.search("sunset", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for caption search: {response:?}");
-        assert_eq!(response[0].1, image_id, "event id doesn't match: {response:?}");
+        assert_eq!(response.events.len(), 1, "unexpected results for caption search: {response:?}");
+        assert_eq!(response.events[0].1, image_id, "event id doesn't match: {response:?}");
 
         // The filename is indexed.
         let response = room.search("holiday_beach", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for filename search: {response:?}");
-        assert_eq!(response[0].1, image_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for filename search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, image_id, "event id doesn't match: {response:?}");
 
         // A media message without a caption still indexes its filename.
         let response = room.search("quarterly_report", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for filename search: {response:?}");
-        assert_eq!(response[0].1, file_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for filename search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, file_id, "event id doesn't match: {response:?}");
     }
 
     #[cfg(feature = "experimental-search")]
@@ -574,8 +789,6 @@ mod tests {
 
         let mock_server = MatrixMockServer::new().await;
         let client = mock_server.client_builder().build().await;
-
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!room_id:localhost");
         let sticker_id = event_id!("$sticker_id:localhost");
@@ -603,18 +816,26 @@ mod tests {
 
         // The sticker's description is indexed.
         let response = room.search("waving", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for sticker search: {response:?}");
-        assert_eq!(response[0].1, sticker_id, "event id doesn't match: {response:?}");
+        assert_eq!(response.events.len(), 1, "unexpected results for sticker search: {response:?}");
+        assert_eq!(response.events[0].1, sticker_id, "event id doesn't match: {response:?}");
 
         // The poll question is indexed.
         let response = room.search("cheese", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for poll question search: {response:?}");
-        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for poll question search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, poll_id, "event id doesn't match: {response:?}");
 
         // The poll answers are indexed.
         let response = room.search("gruyère", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for poll answer search: {response:?}");
-        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for poll answer search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, poll_id, "event id doesn't match: {response:?}");
     }
 
     #[cfg(feature = "experimental-search")]
@@ -627,8 +848,6 @@ mod tests {
 
         let mock_server = MatrixMockServer::new().await;
         let client = mock_server.client_builder().build().await;
-
-        client.event_cache().subscribe().unwrap();
 
         let room_id = room_id!("!room_id:localhost");
         let poll_id = event_id!("$stable_poll_id:localhost");
@@ -654,13 +873,21 @@ mod tests {
 
         // The poll question is indexed.
         let response = room.search("cheese", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for poll question search: {response:?}");
-        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for poll question search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, poll_id, "event id doesn't match: {response:?}");
 
         // The poll answers are indexed.
         let response = room.search("gruyère", 5, None).await.unwrap();
-        assert_eq!(response.len(), 1, "unexpected results for poll answer search: {response:?}");
-        assert_eq!(response[0].1, poll_id, "event id doesn't match: {response:?}");
+        assert_eq!(
+            response.events.len(),
+            1,
+            "unexpected results for poll answer search: {response:?}"
+        );
+        assert_eq!(response.events[0].1, poll_id, "event id doesn't match: {response:?}");
     }
 
     #[cfg(feature = "experimental-search")]
@@ -676,14 +903,12 @@ mod tests {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
-
         let room = server.sync_joined_room(&client, room_id).await;
 
         let f = EventFactory::new().room(room_id).sender(user_id!("@user_id:localhost"));
 
-        // Indexable dummy message required because RoomIndex is initialised lazily.
+        // Indexable dummy message required because RoomIndex is initialised
+        // lazily.
         let dummy = f.text_msg("dummy").event_id(dummy_id);
 
         let original = f.text_msg("This is a message").event_id(original_id);
@@ -721,34 +946,34 @@ mod tests {
 
         let results = room.search("message", 3, None).await.unwrap();
 
-        assert_eq!(results.len(), 0, "Search should return 0 results, got {results:?}");
+        assert_eq!(results.events.len(), 0, "Search should return 0 results, got {results:?}");
 
-        // Adding the original after some pending edits should add the latest edit
-        // instead of the original.
+        // Adding the original after some pending edits should add the latest
+        // edit instead of the original.
         server
             .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(original))
             .await;
 
         let results = room.search("message", 3, None).await.unwrap();
 
-        assert_eq!(results.len(), 1, "Search should return 1 result, got {results:?}");
+        assert_eq!(results.events.len(), 1, "Search should return 1 result, got {results:?}");
         assert_eq!(
-            results[0].1, edit2_id,
+            results.events[0].1, edit2_id,
             "Search should return latest edit, got {:?}",
-            results[0].1
+            results.events[0].1
         );
 
-        // Editing the original after it exists and there has been another edit should
-        // delete the previous edits and add this one
+        // Editing the original after it exists and there has been another edit
+        // should delete the previous edits and add this one
         server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(edit3)).await;
 
         let results = room.search("message", 3, None).await.unwrap();
 
-        assert_eq!(results.len(), 1, "Search should return 1 result, got {results:?}");
+        assert_eq!(results.events.len(), 1, "Search should return 1 result, got {results:?}");
         assert_eq!(
-            results[0].1, edit3_id,
+            results.events[0].1, edit3_id,
             "Search should return latest edit, got {:?}",
-            results[0].1
+            results.events[0].1
         );
     }
 
@@ -761,9 +986,6 @@ mod tests {
 
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
 
         let room = server.sync_joined_room(&client, room_id).await;
 
@@ -786,8 +1008,8 @@ mod tests {
 
         // The original message is indexed.
         let results = room.search("alpha", 3, None).await.unwrap();
-        assert_eq!(results.len(), 1, "Original should be indexed, got {results:?}");
-        assert_eq!(results[0].1, original_id, "unexpected event id: {results:?}");
+        assert_eq!(results.events.len(), 1, "Original should be indexed, got {results:?}");
+        assert_eq!(results.events[0].1, original_id, "unexpected event id: {results:?}");
 
         server
             .sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(malicious_edit))
@@ -795,11 +1017,11 @@ mod tests {
 
         // The forged edit's content must not be indexed.
         let results = room.search("beta", 3, None).await.unwrap();
-        assert_eq!(results.len(), 0, "Cross-sender edit should be ignored, got {results:?}");
+        assert_eq!(results.events.len(), 0, "Cross-sender edit should be ignored, got {results:?}");
 
         // The original message stays indexed.
         let results = room.search("alpha", 3, None).await.unwrap();
-        assert_eq!(results.len(), 1, "Original should stay indexed, got {results:?}");
-        assert_eq!(results[0].1, original_id, "unexpected event id: {results:?}");
+        assert_eq!(results.events.len(), 1, "Original should stay indexed, got {results:?}");
+        assert_eq!(results.events[0].1, original_id, "unexpected event id: {results:?}");
     }
 }

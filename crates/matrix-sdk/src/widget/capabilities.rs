@@ -60,6 +60,18 @@ pub struct Capabilities {
 
     /// This allows the widget to download files as per MSC4039.
     pub download_file: bool,
+
+    /// This allows the widget to discover the RTC transports advertised by the
+    /// homeserver as per MSC4515.
+    pub rtc_transports: bool,
+
+    /// This allows the widget to obtain a token to authenticate with a LiveKit
+    /// SFU from the homeserver as per MSC4533.
+    pub rtc_livekit_get_token: bool,
+
+    /// This allows the widget to hand the delayed leave event of a MatrixRTC
+    /// session over to the homeserver as per MSC4533.
+    pub rtc_livekit_delegate_delayed_leave: bool,
 }
 
 impl Capabilities {
@@ -119,6 +131,12 @@ pub(super) const UPDATE_DELAYED_EVENT: &str = "org.matrix.msc4157.update_delayed
 
 pub(super) const DOWNLOAD_FILE: &str = "org.matrix.msc4039.download_file";
 
+pub(super) const RTC_TRANSPORTS: &str = "org.matrix.msc4515.rtc_transports";
+
+pub(super) const RTC_LIVEKIT_GET_TOKEN: &str = "org.matrix.msc4533.rtc_livekit_get_token";
+pub(super) const RTC_LIVEKIT_DELEGATE_DELAYED_LEAVE: &str =
+    "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave";
+
 impl Serialize for Capabilities {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -131,9 +149,11 @@ impl Serialize for Capabilities {
                     Filter::MessageLike(filter) => PrintMessageLikeEventFilter(filter).fmt(f),
                     Filter::State(filter) => PrintStateEventFilter(filter).fmt(f),
                     Filter::ToDevice(filter) => {
-                        // As per MSC 3819 https://github.com/matrix-org/matrix-spec-proposals/pull/3819
-                        // ToDevice capabilities is in the form of `m.send.to_device:<event type>`
-                        // or `m.receive.to_device:<event type>`
+                        // As per MSC 3819
+                        // https://github.com/matrix-org/matrix-spec-proposals/pull/3819
+                        // ToDevice capabilities is in the form of
+                        // `m.send.to_device:<event type>` or
+                        // `m.receive.to_device:<event type>`
                         write!(f, "{}", filter.event_type)
                     }
                 }
@@ -145,7 +165,8 @@ impl Serialize for Capabilities {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 match self.0 {
                     MessageLikeEventFilter::WithType(event_type) => {
-                        // TODO: escape `#` as `\#` and `\` as `\\` in event_type
+                        // TODO: escape `#` as `\#` and `\` as `\\` in
+                        // event_type
                         write!(f, "{event_type}")
                     }
                     MessageLikeEventFilter::RoomMessageWithMsgtype(msgtype) => {
@@ -182,6 +203,15 @@ impl Serialize for Capabilities {
         if self.download_file {
             seq.serialize_element(DOWNLOAD_FILE)?;
         }
+        if self.rtc_transports {
+            seq.serialize_element(RTC_TRANSPORTS)?;
+        }
+        if self.rtc_livekit_get_token {
+            seq.serialize_element(RTC_LIVEKIT_GET_TOKEN)?;
+        }
+        if self.rtc_livekit_delegate_delayed_leave {
+            seq.serialize_element(RTC_LIVEKIT_DELEGATE_DELAYED_LEAVE)?;
+        }
         for filter in &self.read {
             let name = match filter {
                 Filter::MessageLike(_) => READ_EVENT,
@@ -213,6 +243,9 @@ impl<'de> Deserialize<'de> for Capabilities {
             UpdateDelayedEvent,
             SendDelayedEvent,
             DownloadFile,
+            RtcTransports,
+            RtcLivekitGetToken,
+            RtcLivekitDelegateDelayedLeave,
             Read(Filter),
             Send(Filter),
             Unknown,
@@ -235,6 +268,15 @@ impl<'de> Deserialize<'de> for Capabilities {
                 }
                 if s == DOWNLOAD_FILE {
                     return Ok(Self::DownloadFile);
+                }
+                if s == RTC_TRANSPORTS {
+                    return Ok(Self::RtcTransports);
+                }
+                if s == RTC_LIVEKIT_GET_TOKEN {
+                    return Ok(Self::RtcLivekitGetToken);
+                }
+                if s == RTC_LIVEKIT_DELEGATE_DELAYED_LEAVE {
+                    return Ok(Self::RtcLivekitDelegateDelayedLeave);
                 }
 
                 match s.split_once(':') {
@@ -273,7 +315,8 @@ impl<'de> Deserialize<'de> for Capabilities {
         }
 
         fn parse_state_event_filter(s: &str) -> StateEventFilter {
-            // TODO: Search for un-escaped `#` only, replace `\\` by `\` and `\#` by `#`
+            // TODO: Search for un-escaped `#` only, replace `\\` by `\` and
+            // `\#` by `#`
             match s.split_once('#') {
                 Some((event_type, state_key)) => {
                     StateEventFilter::WithTypeAndStateKey(event_type.into(), state_key.to_owned())
@@ -297,6 +340,11 @@ impl<'de> Deserialize<'de> for Capabilities {
                 Permission::UpdateDelayedEvent => capabilities.update_delayed_event = true,
                 Permission::SendDelayedEvent => capabilities.send_delayed_event = true,
                 Permission::DownloadFile => capabilities.download_file = true,
+                Permission::RtcTransports => capabilities.rtc_transports = true,
+                Permission::RtcLivekitGetToken => capabilities.rtc_livekit_get_token = true,
+                Permission::RtcLivekitDelegateDelayedLeave => {
+                    capabilities.rtc_livekit_delegate_delayed_leave = true
+                }
             }
         }
 
@@ -335,7 +383,10 @@ mod tests {
             "org.matrix.msc3819.send.to_device:io.element.call.encryption_keys",
             "org.matrix.msc4157.send.delayed_event",
             "org.matrix.msc4157.update_delayed_event",
-            "org.matrix.msc4039.download_file"
+            "org.matrix.msc4039.download_file",
+            "org.matrix.msc4515.rtc_transports",
+            "org.matrix.msc4533.rtc_livekit_get_token",
+            "org.matrix.msc4533.rtc_livekit_delegate_delayed_leave"
         ]"#;
 
         let parsed = serde_json::from_str::<Capabilities>(capabilities_str).unwrap();
@@ -366,6 +417,9 @@ mod tests {
             update_delayed_event: true,
             send_delayed_event: true,
             download_file: true,
+            rtc_transports: true,
+            rtc_livekit_get_token: true,
+            rtc_livekit_delegate_delayed_leave: true,
         };
 
         assert_eq!(parsed, expected);
@@ -397,6 +451,9 @@ mod tests {
             update_delayed_event: false,
             send_delayed_event: false,
             download_file: false,
+            rtc_transports: true,
+            rtc_livekit_get_token: true,
+            rtc_livekit_delegate_delayed_leave: false,
         };
 
         let capabilities_str = serde_json::to_string(&capabilities).unwrap();

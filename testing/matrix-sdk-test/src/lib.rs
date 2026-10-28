@@ -4,7 +4,7 @@ use http::Response;
 pub use matrix_sdk_test_macros::async_test;
 use ruma::{
     RoomId, UserId,
-    api::{IncomingResponse, OutgoingResponse},
+    api::{IncomingResponse, IncomingResponseExt as _, OutgoingResponse, OutgoingResponseExt as _},
     room_id,
     serde::{Base64, base64::UrlSafe},
     user_id,
@@ -71,17 +71,18 @@ macro_rules! stripped_state_event {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-pub mod mocks;
-
 pub mod event_factory;
+mod identifiers;
 pub mod notification_settings;
 mod sync_builder;
 pub mod test_json;
 
-pub use self::sync_builder::{
-    InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
-    SyncResponseBuilder, bulk_room_members,
+pub use self::{
+    identifiers::*,
+    sync_builder::{
+        InvitedRoomBuilder, JoinedRoomBuilder, KnockedRoomBuilder, LeftRoomBuilder,
+        SyncResponseBuilder, bulk_room_members,
+    },
 };
 
 pub static ALICE: LazyLock<&UserId> = LazyLock::new(|| user_id!("@alice:server.name"));
@@ -97,8 +98,10 @@ pub fn ruma_response_from_json<ResponseType: IncomingResponse>(
     json: &serde_json::Value,
 ) -> ResponseType {
     let json_bytes = serde_json::to_vec(json).expect("JSON-serialization of response value failed");
-    let http_response =
-        Response::builder().status(200).body(json_bytes).expect("Failed to build HTTP response");
+    let http_response = Response::builder()
+        .status(200)
+        .body(json_bytes.as_slice())
+        .expect("Failed to build HTTP response");
     ResponseType::try_from_http_response(http_response).expect("Can't parse the response json")
 }
 

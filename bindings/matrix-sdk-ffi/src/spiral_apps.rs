@@ -5,18 +5,20 @@
 // SPIRAL (Brief 0066, ADR-0007): the three FFI additions an Interactive Post
 // needs and upstream does not expose.
 //
-// 1. The timeline must let the post through `default_event_filter`, which
-//    drops an `m.room.message` whose `msgtype` it does not know. An
-//    Interactive Post IS a message — the same kind of thing as a photo — so
-//    it travels as `m.room.message` with `msgtype: com.spiral.app` and a
-//    `body` that every other client can render. The ACTION type is a custom
-//    event and deliberately NOT let through: actions are read via relations,
-//    never rendered as rows, and upstream's filter drops them for free.
-// 2. A client must be able to collect every action related to a post no
-//    matter how far back the post is. `Room::load_or_fetch_event_with_relations`
-//    exists in `matrix-sdk` but has no UniFFI surface; this file exports it,
-//    returning raw (decrypted) event JSON — the same shape the client already
-//    parses for `com.spiral.*` from `debugInfo.originalJSON`.
+// 1. The timeline must let the post through `default_event_filter`, which drops
+//    an `m.room.message` whose `msgtype` it does not know. An Interactive Post
+//    IS a message — the same kind of thing as a photo — so it travels as
+//    `m.room.message` with `msgtype: com.spiral.app` and a `body` that every
+//    other client can render. The ACTION type is a custom event and
+//    deliberately NOT let through: actions are read via relations, never
+//    rendered as rows, and upstream's filter drops them for free.
+// 2. A client must be able to collect every action related to a post no matter
+//    how far back the post is. `Room::load_or_fetch_event_with_relations`
+//    exists in `matrix-sdk`; upstream's UniFFI export (26.10) returns typed
+//    events that cannot carry custom content, so this file exports it as
+//    `spiral_load_or_fetch_event_with_relations`, returning raw (decrypted)
+//    event JSON — the same shape the client already parses for `com.spiral.*`
+//    from `debugInfo.originalJSON`.
 // 3. A client must learn, live, that an action has arrived. Because (1) keeps
 //    actions out of the timeline, no `TimelineDiff` is ever produced for one,
 //    so there is nothing to observe up there. `subscribe_to_events_of_type`
@@ -124,7 +126,8 @@ fn is_spiral_app_post(event: &AnySyncTimelineEvent) -> bool {
         || msgtype == NOTICE_MSGTYPE
 }
 
-/// Relation type filter for [`Room::load_or_fetch_event_with_relations`].
+/// Relation type filter for
+/// [`Room::spiral_load_or_fetch_event_with_relations`].
 #[derive(Clone, Copy, Debug, uniffi::Enum)]
 pub enum RelationTypeFilter {
     /// `m.reference` — what Interactive Post actions use.
@@ -150,7 +153,7 @@ impl From<RelationTypeFilter> for RelationType {
 
 /// An event plus every event related to it, as raw (decrypted) JSON.
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct EventWithRelations {
+pub struct SpiralEventWithRelations {
     /// The target event, as it would appear in `/sync` (no `room_id`).
     pub event_json: String,
     /// The related events, in the order the server / cache returned them.
@@ -168,11 +171,14 @@ impl Room {
     /// Both the target and the relations are returned decrypted, as raw
     /// event JSON, so a caller can read custom content the typed FFI
     /// `TimelineEvent` cannot represent.
-    pub async fn load_or_fetch_event_with_relations(
+    ///
+    /// Named apart from upstream's typed `load_or_fetch_event_with_relations`
+    /// (26.10), which cannot carry custom content.
+    pub async fn spiral_load_or_fetch_event_with_relations(
         &self,
         event_id: String,
         filter: Option<RelationTypeFilter>,
-    ) -> Result<EventWithRelations, ClientError> {
+    ) -> Result<SpiralEventWithRelations, ClientError> {
         let event_id = EventId::parse(event_id)?;
         let filter = filter.map(|f| vec![RelationType::from(f)]);
 
@@ -183,7 +189,7 @@ impl Room {
         let relations_json =
             relations.into_iter().map(|ev| ev.into_raw().json().get().to_owned()).collect();
 
-        Ok(EventWithRelations { event_json, relations_json })
+        Ok(SpiralEventWithRelations { event_json, relations_json })
     }
 
     /// A live view of this room's event cache, for observing event types the
@@ -196,7 +202,11 @@ impl Room {
     /// is still in memory. Subscribe when a room is opened, drop when it
     /// closes; do NOT hold one for every room at once.
     pub async fn spiral_event_observer(&self) -> Result<Arc<SpiralEventObserver>, ClientError> {
-        let (cache, _drop_handles) = self.inner.event_cache().await?;
+        let client = self.inner.client();
+        let event_cache = client
+            .event_cache()
+            .ok_or_else(|| ClientError::from_str("The event cache is disabled", None))?;
+        let (cache, _drop_handles) = event_cache.room(self.inner.room_id()).await?;
         Ok(Arc::new(SpiralEventObserver { cache }))
     }
 }
@@ -235,7 +245,8 @@ impl From<matrix_sdk::Error> for RawSendError {
             }
             QueueWedgeError::IdentityViolations { users } => Self::IdentityViolations { users },
             QueueWedgeError::CrossVerificationRequired => Self::CrossVerificationRequired,
-            QueueWedgeError::MissingMediaContent
+            QueueWedgeError::ExpiredAccessToken
+            | QueueWedgeError::MissingMediaContent
             | QueueWedgeError::InvalidMimeType { .. }
             | QueueWedgeError::GenericApiError { .. } => {
                 // Every other failure as the FFI would have reported it —
@@ -522,19 +533,19 @@ fn matching_events(
 
 #[cfg(test)]
 mod tests {
-    use eyeball_im::VectorDiff;
-    use matrix_sdk::ruma::{
-        events::AnySyncTimelineEvent, room_version_rules::RoomVersionRules, serde::Raw,
-    };
-    use matrix_sdk_base::event_cache::Event as CachedEvent;
-
     use std::collections::BTreeMap;
 
+    use eyeball_im::VectorDiff;
     use matrix_sdk::{
         encryption::OlmError,
-        ruma::{owned_device_id, owned_user_id},
+        ruma::{
+            events::AnySyncTimelineEvent, owned_device_id, owned_user_id,
+            room_version_rules::RoomVersionRules, serde::Raw,
+        },
     };
-    use matrix_sdk_base::crypto::SessionRecipientCollectionError;
+    use matrix_sdk_base::{
+        crypto::SessionRecipientCollectionError, event_cache::Event as CachedEvent,
+    };
 
     use super::{
         APP_MSGTYPE, GENERATING_MSGTYPE, NOTICE_MSGTYPE, RawSendError, SpiralEventOrigin,

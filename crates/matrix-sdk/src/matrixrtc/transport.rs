@@ -46,10 +46,14 @@ impl LiveKitTransport {
         // deployments answer it with a payload that does not match the MSC. A
         // homeserver we cannot understand here must not prevent the call, so
         // any failure falls through to `.well-known`.
-        match client.rtc_transports().await {
+        //
+        // `discover_rtc_transports` already answers the `.well-known` foci when
+        // the endpoint is not implemented; the explicit fallback below covers
+        // an endpoint that answers but offers nothing we can use, and errors.
+        match client.discover_rtc_transports().await {
             Ok(Some(transports)) => {
                 if let Some(transport) = Self::pick(&transports) {
-                    debug!("Using a MatrixRTC transport advertised by the homeserver");
+                    debug!("Using a discovered MatrixRTC transport");
                     return Ok(transport);
                 }
             }

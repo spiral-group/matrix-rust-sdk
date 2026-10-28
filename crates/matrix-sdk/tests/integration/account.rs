@@ -1,4 +1,6 @@
-use assert_matches2::assert_matches;
+#[cfg(feature = "unstable-msc4426")]
+use std::assert_matches;
+
 use matrix_sdk::test_utils::mocks::MatrixMockServer;
 use matrix_sdk_test::async_test;
 use ruma::{
@@ -9,63 +11,35 @@ use ruma::{
     mxc_uri,
     profile::{ProfileFieldName, ProfileFieldValue},
 };
-use serde_json::json;
-use wiremock::{
-    Mock, Request, ResponseTemplate,
-    matchers::{method, path},
-};
-
-use crate::logged_in_client_with_server;
+use strass::assert_let;
 
 #[async_test]
 async fn test_account_deactivation() {
-    #[derive(serde::Deserialize)]
-    struct Parameters {
-        pub id_server: Option<String>,
-        pub erase: Option<bool>,
-    }
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
 
-    let (client, server) = logged_in_client_with_server().await;
+    // Check with an identity server.
+    let id_server = "FirstIdentityServer";
+    server
+        .mock_deactivate_account(Some(id_server), false)
+        .ok_with_success()
+        .mock_once()
+        .named("deactivate account with ID server")
+        .mount()
+        .await;
 
-    {
-        let _scope = Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/account/deactivate"))
-            .respond_with(|req: &Request| {
-                let params: Parameters = req.body_json().unwrap();
-                assert_eq!(params.id_server, Some("FirstIdentityServer".to_owned()));
-                assert_eq!(params.erase, None);
+    client.account().deactivate(Some(id_server), None, false).await.unwrap();
 
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id_server_unbind_result": "success"
-                }))
-            })
-            .expect(1)
-            .mount_as_scoped(&server)
-            .await;
+    // Check with the erase parameter.
+    server
+        .mock_deactivate_account(None, true)
+        .ok_with_success()
+        .mock_once()
+        .named("deactivate account with erase")
+        .mount()
+        .await;
 
-        assert!(
-            client.account().deactivate(Some("FirstIdentityServer"), None, false).await.is_ok()
-        );
-    }
-
-    {
-        let _scope = Mock::given(method("POST"))
-            .and(path("/_matrix/client/r0/account/deactivate"))
-            .respond_with(|req: &Request| {
-                let params: Parameters = req.body_json().unwrap();
-                assert_eq!(params.id_server, None);
-                assert_eq!(params.erase, Some(true));
-
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "id_server_unbind_result": "success"
-                }))
-            })
-            .expect(1)
-            .mount_as_scoped(&server)
-            .await;
-
-        assert!(client.account().deactivate(None, None, true).await.is_ok());
-    }
+    client.account().deactivate(None, None, true).await.unwrap();
 }
 
 #[async_test]
@@ -109,7 +83,7 @@ async fn test_fetch_profile_field() {
         .fetch_profile_field_of(user_id.to_owned(), ProfileFieldName::TimeZone)
         .await
         .unwrap();
-    assert_matches!(res_value, Some(ProfileFieldValue::TimeZone(res_tz)));
+    assert_let!(Some(ProfileFieldValue::TimeZone(res_tz)) = res_value);
     assert_eq!(res_tz, tz);
     let res_tz =
         account.fetch_profile_field_of_static::<TimeZone>(user_id.to_owned()).await.unwrap();
@@ -257,10 +231,8 @@ async fn test_fetch_removed_avatar_url() {
 
     server
         .mock_get_profile_field(user_id, ProfileFieldName::AvatarUrl)
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            // This is what Synapse returns after calling Account::set_avatar_url(None).
-            json!({"avatar_url":null}),
-        ))
+        // This is what Synapse returns after calling Account::set_avatar_url(None).
+        .ok_with_value(Some(serde_json::Value::Null))
         .mock_once()
         .named("get avatar_url")
         .mount()
@@ -304,7 +276,8 @@ async fn test_get_cached_avatar_url() {
     let res_avatar_url = account.get_cached_avatar_url().await.unwrap();
     assert_eq!(res_avatar_url.as_deref(), Some(avatar_url));
 
-    // Fetch it again from the homeserver, a missing value should empty the cache.
+    // Fetch it again from the homeserver, a missing value should empty the
+    // cache.
     {
         let _guard = server
             .mock_get_profile_field(user_id, ProfileFieldName::AvatarUrl)
@@ -326,11 +299,23 @@ async fn test_get_cached_avatar_url() {
 #[cfg(feature = "unstable-msc4426")]
 #[async_test]
 async fn test_set_status() {
-    use ruma::profile::StatusProfileField;
+    use std::collections::BTreeSet;
 
+    use ruma::profile::{Status, StatusProfileField};
+
+    // Given an account without a status.
     let server = MatrixMockServer::new().await;
-    let client = server.client_builder().server_versions(vec![MatrixVersion::V1_16]).build().await;
+    server
+        .mock_versions()
+        .with_versions(vec!["v1.16"])
+        .with_profiles_sliding_sync_extension()
+        .ok()
+        .named("versions")
+        .mount()
+        .await;
+    let client = server.client_builder().no_server_versions().build().await;
     let user_id = client.user_id().unwrap();
+    let mut profile_updates = client.subscribe_to_global_profile_updates();
 
     server
         .mock_set_profile_field(user_id, ProfileFieldName::Status)
@@ -344,17 +329,56 @@ async fn test_set_status() {
         .mount()
         .await;
 
+    // When setting a status.
     let account = client.account();
-    account.set_status("🌴".to_owned(), "Away".to_owned()).await.unwrap();
+    let result = account.set_status("🌴".to_owned(), "Away".to_owned()).await;
+
+    // Then the status should be sent and stored as a local echo, with any
+    // subscribers being notified.
+    assert!(result.is_ok());
+    let profile = client
+        .state_store()
+        .get_global_profile(user_id)
+        .await
+        .unwrap()
+        .expect("the local echo should be stored");
+    let status = profile
+        .get_static::<Status>()
+        .expect("the status should deserialize")
+        .expect("the status should be set");
+    assert_eq!(status.text, "Away");
+    assert_eq!(status.emoji, "🌴");
+    assert_eq!(profile_updates.recv().await.unwrap(), BTreeSet::from([user_id.to_owned()]));
 }
 
 #[cfg(feature = "unstable-msc4426")]
 #[async_test]
 async fn test_clear_status() {
+    use std::collections::BTreeSet;
+
+    use ruma::profile::Status;
+
+    // Given an account that already has a status (locally echoed into the store
+    // for this test).
     let server = MatrixMockServer::new().await;
-    let client = server.client_builder().server_versions(vec![MatrixVersion::V1_16]).build().await;
+    server
+        .mock_versions()
+        .with_versions(vec!["v1.16"])
+        .with_profiles_sliding_sync_extension()
+        .ok()
+        .named("versions")
+        .mount()
+        .await;
+    let client = server.client_builder().no_server_versions().build().await;
     let user_id = client.user_id().unwrap();
 
+    server
+        .mock_set_profile_field(user_id, ProfileFieldName::Status)
+        .ok()
+        .mock_once()
+        .named("set org.matrix.msc4426.status profile field")
+        .mount()
+        .await;
     server
         .mock_delete_profile_field(user_id, ProfileFieldName::Status)
         .ok()
@@ -364,7 +388,49 @@ async fn test_clear_status() {
         .await;
 
     let account = client.account();
-    account.clear_status().await.unwrap();
+    account.set_status("🌴".to_owned(), "Away".to_owned()).await.unwrap();
+    let mut profile_updates = client.subscribe_to_global_profile_updates();
+
+    // When the status is cleared.
+    let result = account.clear_status().await;
+
+    // Then the clear should be sent and stored as a local echo, with any
+    // subscribers being notified.
+    assert!(result.is_ok());
+    let profile = client
+        .state_store()
+        .get_global_profile(user_id)
+        .await
+        .unwrap()
+        .expect("the profile should still be stored");
+    assert_matches!(profile.get_static::<Status>(), Ok(None));
+    assert_eq!(profile_updates.recv().await.unwrap(), BTreeSet::from([user_id.to_owned()]));
+}
+
+#[cfg(feature = "unstable-msc4426")]
+#[async_test]
+async fn test_set_status_without_profile_sync() {
+    // Given an account on a server that doesn't support the profiles sliding
+    // sync extension.
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().server_versions(vec![MatrixVersion::V1_16]).build().await;
+    let user_id = client.user_id().unwrap();
+
+    server
+        .mock_set_profile_field(user_id, ProfileFieldName::Status)
+        .ok()
+        .mock_once()
+        .named("set org.matrix.msc4426.status profile field")
+        .mount()
+        .await;
+
+    // When setting a status.
+    let account = client.account();
+    let result = account.set_status("🌴".to_owned(), "Away".to_owned()).await;
+
+    // Then it should be sent, but not stored locally.
+    assert!(result.is_ok());
+    assert_matches!(client.state_store().get_global_profile(user_id).await, Ok(None));
 }
 
 #[cfg(feature = "unstable-msc4426")]

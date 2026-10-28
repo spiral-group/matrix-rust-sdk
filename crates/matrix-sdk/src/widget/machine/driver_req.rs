@@ -17,7 +17,7 @@
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use ruma::{
-    OwnedMxcUri, OwnedUserId,
+    OwnedMxcUri, OwnedRoomId, OwnedServerName, OwnedUserId,
     api::client::{account::request_openid_token, delayed_events::update_delayed_event},
     events::{AnyStateEvent, AnyTimelineEvent, AnyToDeviceEventContent},
     serde::Raw,
@@ -31,7 +31,13 @@ use super::{
     Action, MatrixDriverRequestMeta, SendToDeviceEventResponse, WidgetMachine,
     from_widget::SendEventResponse, incoming::MatrixDriverResponse,
 };
-use crate::widget::{Capabilities, StateKeySelector, machine::from_widget::DownloadFileResponse};
+use crate::widget::{
+    Capabilities, StateKeySelector,
+    machine::from_widget::{
+        DownloadFileResponse, RtcLivekitDelegateDelayedLeaveResponse, RtcLivekitGetTokenResponse,
+        RtcTransportsResponse,
+    },
+};
 
 #[derive(Clone, Debug)]
 pub(crate) enum MatrixDriverRequestData {
@@ -62,6 +68,16 @@ pub(crate) enum MatrixDriverRequestData {
 
     /// Request a download of a file.
     DownloadFile(DownloadFileRequest),
+
+    /// Get the RTC transports advertised by the homeserver.
+    GetRtcTransports,
+
+    /// Get a token to authenticate with a LiveKit SFU from the homeserver.
+    RtcLivekitGetToken(RtcLivekitGetTokenRequest),
+
+    /// Hand the delayed leave event of a MatrixRTC session over to the
+    /// homeserver.
+    RtcLivekitDelegateDelayedLeave(RtcLivekitDelegateDelayedLeaveRequest),
 }
 
 /// A handle to a pending `toWidget` request.
@@ -115,8 +131,8 @@ where
     }
 }
 
-/// Ask the client (capability provider) to acquire given capabilities
-/// from the user. The client must eventually respond with granted capabilities.
+/// Ask the client (capability provider) to acquire given capabilities from the
+/// user. The client must eventually respond with granted capabilities.
 #[derive(Clone, Debug)]
 pub(crate) struct AcquireCapabilities {
     pub(crate) desired_capabilities: Capabilities,
@@ -158,6 +174,20 @@ impl MatrixDriverRequest for RequestOpenId {
     type Response = request_openid_token::v3::Response;
 }
 
+/// Request the RTC transports advertised by the homeserver.
+#[derive(Debug)]
+pub(crate) struct RequestRtcTransports;
+
+impl From<RequestRtcTransports> for MatrixDriverRequestData {
+    fn from(_: RequestRtcTransports) -> Self {
+        MatrixDriverRequestData::GetRtcTransports
+    }
+}
+
+impl MatrixDriverRequest for RequestRtcTransports {
+    type Response = RtcTransportsResponse;
+}
+
 impl FromMatrixDriverResponse for request_openid_token::v3::Response {
     fn from_response(ev: MatrixDriverResponse) -> Option<Self> {
         match ev {
@@ -175,8 +205,9 @@ impl FromMatrixDriverResponse for request_openid_token::v3::Response {
 #[derive(Clone, Debug)]
 pub(crate) struct ReadEventsRequest {
     /// The event type to read.
-    // TODO: This wants to be `MessageLikeEventType`` but we need a type which supports `as_str()`
-    // as soon as ruma supports `as_str()` on `MessageLikeEventType` we can use it here.
+    // TODO: This wants to be
+    // `MessageLikeEventType`` but we need a type which supports `as_str()` as soon as ruma
+    // supports `as_str()` on `MessageLikeEventType` we can use it here.
     pub(crate) event_type: String,
 
     /// The `state_key` to read. If None, this will read events regardless of
@@ -216,8 +247,9 @@ impl FromMatrixDriverResponse for Vec<Raw<AnyTimelineEvent>> {
 #[derive(Clone, Debug)]
 pub(crate) struct ReadStateRequest {
     /// The event type to read.
-    // TODO: This wants to be `TimelineEventType` but we need a type which supports `as_str()`
-    // as soon as ruma supports `as_str()` on `TimelineEventType` we can use it here.
+    // TODO: This wants to be `TimelineEventType` but we need a type which
+    // supports `as_str()` as soon as ruma supports `as_str()` on
+    // `TimelineEventType` we can use it here.
     pub(crate) event_type: String,
 
     /// The `state_key` to read, or `Any` to receive any/all room state entries
@@ -248,22 +280,24 @@ impl FromMatrixDriverResponse for Vec<Raw<AnyStateEvent>> {
 }
 
 /// Ask the client to send Matrix event that corresponds to the given
-/// description and returns an event ID (or a delay ID,
-/// see [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140)) as a response.
+/// description and returns an event ID (or a delay ID, see
+/// [MSC4140](https://github.com/matrix-org/matrix-spec-proposals/pull/4140)) as
+/// a response.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct SendEventRequest {
     /// The type of the event.
-    // TODO: This wants to be `TimelineEventType` but we need a type which supports `as_str()`
-    // as soon as ruma supports `as_str()` on `TimelineEventType` we can use it here.
+    // TODO: This wants to be `TimelineEventType` but we need a type which
+    // supports `as_str()` as soon as ruma supports `as_str()` on
+    // `TimelineEventType` we can use it here.
     #[serde(rename = "type")]
     pub(crate) event_type: String,
     /// State key of an event (if it's a state event).
     pub(crate) state_key: Option<String>,
     /// Raw content of an event.
     pub(crate) content: Box<RawJsonValue>,
-    /// The optional delay (in ms) to send the event at.
-    /// If provided, the response will contain a delay_id instead of a event_id.
-    /// Defined by [MSC4157](https://github.com/matrix-org/matrix-spec-proposals/pull/4157)
+    /// The optional delay (in ms) to send the event at. If provided, the
+    /// response will contain a delay_id instead of a event_id. Defined by
+    /// [MSC4157](https://github.com/matrix-org/matrix-spec-proposals/pull/4157)
     pub(crate) delay: Option<u64>,
 }
 
@@ -296,9 +330,8 @@ pub(crate) struct SendToDeviceRequest {
     /// The type of the to-device message.
     #[serde(rename = "type")]
     pub(crate) event_type: String,
-    /// The messages to be sent.
-    /// They are organized in a map of user ID -> device ID -> content like the
-    /// cs api request.
+    /// The messages to be sent. They are organized in a map of user ID ->
+    /// device ID -> content like the cs api request.
     pub(crate) messages:
         BTreeMap<OwnedUserId, BTreeMap<DeviceIdOrAllDevices, Raw<AnyToDeviceEventContent>>>,
 }
@@ -314,7 +347,8 @@ impl MatrixDriverRequest for SendToDeviceRequest {
 }
 
 /// Ask the client to send a UpdateDelayedEventRequest with the given `delay_id`
-/// and `action`. Defined by [MSC4157](https://github.com/matrix-org/matrix-spec-proposals/pull/4157)
+/// and `action`. Defined by
+/// [MSC4157](https://github.com/matrix-org/matrix-spec-proposals/pull/4157)
 #[derive(Deserialize, Debug, Clone)]
 pub(crate) struct UpdateDelayedEventRequest {
     pub(crate) action: update_delayed_event::UpdateAction,
@@ -357,4 +391,66 @@ impl From<DownloadFileRequest> for MatrixDriverRequestData {
     fn from(req: DownloadFileRequest) -> Self {
         MatrixDriverRequestData::DownloadFile(req)
     }
+}
+
+/// Ask the client to obtain a token to authenticate with a LiveKit SFU from
+/// the homeserver's `/rtc/livekit/get_token` endpoint
+/// ([MSC4195](https://github.com/matrix-org/matrix-spec-proposals/pull/4195)),
+/// on behalf of the widget. Defined by
+/// [MSC4533](https://github.com/matrix-org/matrix-spec-proposals/pull/4533).
+#[derive(Deserialize, Debug, Clone)]
+pub(crate) struct RtcLivekitGetTokenRequest {
+    /// The server name of the sender of the `m.rtc.member` event.
+    ///
+    /// If this is `None`, the homeserver uses its own server name.
+    #[serde(default)]
+    pub(crate) server_name: Option<OwnedServerName>,
+    /// The WebSocket URL of the LiveKit SFU to obtain a token for.
+    pub(crate) url: String,
+    /// The room where the `m.rtc.member` event is present.
+    pub(crate) room_id: OwnedRoomId,
+    /// The slot ID from the `m.rtc.member` event.
+    pub(crate) slot_id: String,
+    /// The `member.id` property of the requesting user's own `m.rtc.member`
+    /// event.
+    pub(crate) member_id: String,
+}
+
+impl From<RtcLivekitGetTokenRequest> for MatrixDriverRequestData {
+    fn from(req: RtcLivekitGetTokenRequest) -> Self {
+        MatrixDriverRequestData::RtcLivekitGetToken(req)
+    }
+}
+
+impl MatrixDriverRequest for RtcLivekitGetTokenRequest {
+    type Response = RtcLivekitGetTokenResponse;
+}
+
+/// Ask the client to hand the delayed leave event of a MatrixRTC session over
+/// to the homeserver via its `/rtc/livekit/delegate_delayed_leave` endpoint
+/// ([MSC4195](https://github.com/matrix-org/matrix-spec-proposals/pull/4195)),
+/// on behalf of the widget. Defined by
+/// [MSC4533](https://github.com/matrix-org/matrix-spec-proposals/pull/4533).
+#[derive(Deserialize, Debug, Clone)]
+pub(crate) struct RtcLivekitDelegateDelayedLeaveRequest {
+    /// The WebSocket URL of the LiveKit SFU that the user has connected to.
+    pub(crate) url: String,
+    /// The room where the `m.rtc.member` event is present.
+    pub(crate) room_id: OwnedRoomId,
+    /// The slot ID from the `m.rtc.member` event.
+    pub(crate) slot_id: String,
+    /// The `member.id` property of the `m.rtc.member` event.
+    pub(crate) member_id: String,
+    /// The ID of the delayed `m.rtc.member` leave event to delegate.
+    pub(crate) delay_id: String,
+}
+
+impl From<RtcLivekitDelegateDelayedLeaveRequest> for MatrixDriverRequestData {
+    fn from(req: RtcLivekitDelegateDelayedLeaveRequest) -> Self {
+        MatrixDriverRequestData::RtcLivekitDelegateDelayedLeave(req)
+    }
+}
+
+impl MatrixDriverRequest for RtcLivekitDelegateDelayedLeaveRequest {
+    type Response = RtcLivekitDelegateDelayedLeaveResponse;
 }

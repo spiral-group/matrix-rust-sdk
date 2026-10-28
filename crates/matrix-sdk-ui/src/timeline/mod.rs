@@ -18,7 +18,7 @@
 //!
 //! See [`Timeline`] for details.
 
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, iter, path::PathBuf, sync::Arc};
 
 use algorithms::rfind_event_by_item_id;
 use event_item::TimelineItemHandle;
@@ -46,11 +46,13 @@ use ruma::{
     api::client::receipt::create_receipt::v3::ReceiptType,
     events::{
         AnyMessageLikeEventContent, AnySyncTimelineEvent, Mentions,
+        location::{AssetType, LocationContent, ZoomLevel},
         poll::unstable_start::{NewUnstablePollStartEventContent, UnstablePollStartEventContent},
         receipt::{Receipt, ReceiptThread},
-        relation::Thread,
+        relation::{RelationType, Thread},
         room::message::{
-            AddMentions, Relation, RelationWithoutReplacement, ReplyWithinThread,
+            AddMentions, LocationMessageEventContent, MessageType, Relation,
+            RelationWithoutReplacement, ReplyWithinThread, RoomMessageEventContent,
             RoomMessageEventContentWithoutRelation, TextMessageEventContent,
         },
     },
@@ -63,7 +65,7 @@ use tracing::{instrument, trace, warn};
 use self::{
     algorithms::rfind_event_by_id, controller::TimelineController, futures::SendAttachment,
 };
-use crate::timeline::controller::CryptoDropHandles;
+use crate::timeline::controller::{CryptoDropHandles, SendReceiptDecision};
 
 mod algorithms;
 mod builder;
@@ -91,13 +93,13 @@ pub use self::{
     error::*,
     event_filter::{TimelineEventCondition, TimelineEventFilter},
     event_item::{
-        AnyOtherStateEventContentChange, BeaconInfo, EmbeddedEvent, EncryptedMessage,
+        AnyOtherStateEventContentChange, BeaconInfo, EditRevision, EmbeddedEvent, EncryptedMessage,
         EventItemOrigin, EventSendState, EventTimelineItem, InReplyToDetails, LiveLocationState,
         MediaUploadProgress, MemberProfileChange, MembershipChange, Message, MsgLikeContent,
         MsgLikeKind, OtherMessageLike, OtherState, PollResult, PollState, Profile, ReactionInfo,
-        ReactionStatus, ReactionsByKeyBySender, RoomMembershipChange, RoomPinnedEventsChange,
-        RtcCallOutcome, Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId,
-        TimelineEventShieldState, TimelineEventShieldStateCode, TimelineItemContent,
+        ReactionsByKeyBySender, RoomMembershipChange, RoomPinnedEventsChange, RtcCallOutcome,
+        Sticker, ThreadSummary, TimelineDetails, TimelineEventItemId, TimelineEventShieldState,
+        TimelineEventShieldStateCode, TimelineItemContent,
     },
     item::{TimelineItem, TimelineItemKind, TimelineUniqueId},
     latest_event::{LatestEventValue, LatestEventValueLocalState},
@@ -105,6 +107,26 @@ pub use self::{
     traits::RoomExt,
     virtual_item::VirtualTimelineItem,
 };
+
+/// Which pending send on an item [`Timeline::retry_send`] and
+/// [`Timeline::abort_send`] act on.
+#[derive(Clone, Debug)]
+pub enum SendTarget {
+    /// The item itself, while it's a local echo.
+    ///
+    /// Note that aborting one that's already in flight queues a redaction for
+    /// it, without a reason; use [`SendHandle::abort_with_reason`] if one is
+    /// needed.
+    ///
+    /// [`SendHandle::abort_with_reason`]: matrix_sdk::send_queue::SendHandle::abort_with_reason
+    Event,
+    /// Our pending edit of the item.
+    Edit,
+    /// Our pending redaction of the item.
+    Redaction,
+    /// Our pending reaction to the item with this key.
+    Reaction { key: String },
+}
 
 /// A high-level view into a regular¹ room's contents.
 ///
@@ -143,14 +165,14 @@ pub enum TimelineFocus {
     },
 
     /// Focus on a specific thread
-    Thread { root_event_id: OwnedEventId },
+    Thread { thread_id: OwnedEventId },
 
     /// Only show pinned events.
     PinnedEvents,
 }
 
-/// Options for controlling the behaviour of [`TimelineFocus::Event`]
-/// for threaded events.
+/// Options for controlling the behaviour of [`TimelineFocus::Event`] for
+/// threaded events.
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TimelineEventFocusThreadMode {
@@ -158,17 +180,16 @@ pub enum TimelineEventFocusThreadMode {
     ///
     /// When the focused event is part of a thread, the timeline will be focused
     /// on that thread's root. Otherwise, the timeline will treat the target
-    /// event itself as the thread root. Threaded events will never be
-    /// hidden.
+    /// event itself as the thread root. Threaded events will never be hidden.
     ForceThread,
 
     /// Automatically determine if the target event is part of a thread or not.
     ///
-    /// If the event is part of a thread, the timeline
-    /// will be filtered to on-thread events.
+    /// If the event is part of a thread, the timeline will be filtered to
+    /// on-thread events.
     Automatic {
-        /// When the target event is not part of a thread, whether to
-        /// hide in-thread replies from the live timeline.
+        /// When the target event is not part of a thread, whether to hide
+        /// in-thread replies from the live timeline.
         ///
         /// Has no effect when the target event is part of a thread.
         ///
@@ -193,7 +214,9 @@ impl TimelineFocus {
         match self {
             TimelineFocus::Live { .. } => "live".to_owned(),
             TimelineFocus::Event { target, .. } => format!("permalink:{target}"),
-            TimelineFocus::Thread { root_event_id, .. } => format!("thread:{root_event_id}"),
+            TimelineFocus::Thread { thread_id, .. } => {
+                format!("thread:{thread_id}")
+            }
             TimelineFocus::PinnedEvents => "pinned-events".to_owned(),
         }
     }
@@ -220,6 +243,7 @@ pub struct AttachmentConfig {
     pub caption: Option<TextMessageEventContent>,
     pub mentions: Option<Mentions>,
     pub in_reply_to: Option<OwnedEventId>,
+    pub extra_content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl Timeline {
@@ -273,7 +297,7 @@ impl Timeline {
 
     /// Get the current timeline item for the given event ID, if any.
     ///
-    /// Will return a remote event, *or* a local echo that has been sent but not
+    /// Will return a remote event, _or_ a local echo that has been sent but not
     /// yet replaced by a remote echo.
     ///
     /// It's preferable to store the timeline items in the model for your UI, if
@@ -283,6 +307,38 @@ impl Timeline {
         let items = self.controller.items().await;
         let (_, item) = rfind_event_by_id(&items, event_id)?;
         Some(item.to_owned())
+    }
+
+    /// Get the edit history for the given event.
+    ///
+    /// Returns all revisions of the event, in chronological order. The first
+    /// entry is the original event content, followed by each edit in the order
+    /// they were applied.
+    ///
+    /// This looks up the event and all `m.replace` relations targeting it,
+    /// first in the event cache and falling back to the homeserver if needed.
+    /// This works regardless of the timeline's focus kind (live, thread,
+    /// permalink, or pinned events).
+    pub async fn edit_revisions(&self, event_id: &EventId) -> Result<Vec<EditRevision>, Error> {
+        let Ok((original_event, edit_events)) = self
+            .controller
+            .find_event_with_relations(event_id, Some(vec![RelationType::Replacement]))
+            .await
+        else {
+            return Ok(Vec::new());
+        };
+
+        let room = self.room();
+        let mut revisions = Vec::with_capacity(edit_events.len() + 1);
+
+        for event in iter::once(original_event).chain(edit_events) {
+            let timestamp = event.timestamp();
+            if let Some(content) = TimelineItemContent::from_event(room, event).await {
+                revisions.push(EditRevision { content, timestamp });
+            }
+        }
+
+        Ok(revisions)
     }
 
     /// Get the latest of the timeline's remote event ids.
@@ -317,6 +373,7 @@ impl Timeline {
     /// `send_state` to [`EventSendState::SendingFailed`].
     ///
     /// This will do the right thing in the presence of threads:
+    ///
     /// - if this timeline is not focused on a thread, then it will send the
     ///   event as is.
     /// - if this is a threaded timeline, and the event to send is a room
@@ -325,11 +382,25 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `content` - The content of the message event.
+    /// - `content` - The content of the message event.
     #[instrument(skip(self, content), fields(room_id = ?self.room().room_id()))]
-    pub async fn send(&self, mut content: AnyMessageLikeEventContent) -> Result<SendHandle, Error> {
-        // If this is a room event we're sending in a threaded timeline, we add the
-        // thread relation ourselves.
+    pub async fn send(&self, content: AnyMessageLikeEventContent) -> Result<SendHandle, Error> {
+        self.send_with_extra_content(content, None).await
+    }
+
+    /// Queues an event in this room's send queue, with additional top-level
+    /// fields merged into its content. The event's own fields take precedence
+    /// on conflicts.
+    ///
+    /// See [`Self::send`] for more details.
+    #[instrument(skip(self, content, extra_content), fields(room_id = ?self.room().room_id()))]
+    pub async fn send_with_extra_content(
+        &self,
+        mut content: AnyMessageLikeEventContent,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<SendHandle, Error> {
+        // If this is a room event we're sending in a threaded timeline, we add
+        // the thread relation ourselves.
         if content.relation().is_none()
             && let Some(reply) = self.infer_reply(None).await
         {
@@ -338,9 +409,9 @@ impl Timeline {
                     content = self
                         .room()
                         .make_reply_event(
-                            // Note: this `.into()` gets rid of the relation, but we've checked
-                            // previously that the `relates_to` field wasn't
-                            // set.
+                            // Note: this `.into()` gets rid of the relation,
+                            // but we've checked previously that the
+                            // `relates_to` field wasn't set.
                             room_msg_content.clone().into(),
                             reply,
                         )
@@ -370,7 +441,13 @@ impl Timeline {
             }
         }
 
-        Ok(self.room().send_queue().send(content).await?)
+        let queue = self.room().send_queue();
+        let send = queue.send(content);
+        let send = match extra_content {
+            Some(extra_content) => send.with_extra_content(extra_content),
+            None => send,
+        };
+        Ok(send.await?)
     }
 
     /// Send a reply to the given event.
@@ -380,10 +457,11 @@ impl Timeline {
     /// change. Use [`EventTimelineItem::can_be_replied_to`] to decide whether
     /// to render a reply button.
     ///
-    /// The sender will be added to the mentions of the reply if
-    /// and only if the event has not been written by the sender.
+    /// The sender will be added to the mentions of the reply if and only if the
+    /// event has not been written by the sender.
     ///
     /// This will do the right thing in the presence of threads:
+    ///
     /// - if this timeline is not focused on a thread, then it will forward the
     ///   thread relationship of the replied-to event, if present.
     /// - if this is a threaded timeline, it will mark the reply as an in-thread
@@ -391,30 +469,64 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `content` - The content of the reply.
-    ///
-    /// * `in_reply_to` - The ID of the event to reply to.
+    /// - `content` - The content of the reply.
+    /// - `in_reply_to` - The ID of the event to reply to.
     #[instrument(skip(self, content))]
     pub async fn send_reply(
         &self,
         content: RoomMessageEventContentWithoutRelation,
         in_reply_to: OwnedEventId,
-    ) -> Result<(), Error> {
+    ) -> Result<SendHandle, Error> {
         let reply = self
             .infer_reply(Some(in_reply_to))
             .await
             .expect("the reply will always be set because we provided a replied-to event id");
         let content = self.room().make_reply_event(content, reply).await?;
-        self.send(content.into()).await?;
-        Ok(())
+        self.send(content.into()).await
+    }
+
+    /// Send a location event to the room, with `body` as the plain-text
+    /// fallback and `geo_uri` its RFC 5870 representation. With `in_reply_to`,
+    /// the location is sent as a reply, with [`Self::send_reply`] semantics.
+    #[instrument(skip(self, body, geo_uri, description))]
+    pub async fn send_location(
+        &self,
+        body: String,
+        geo_uri: String,
+        description: Option<String>,
+        zoom_level: Option<ZoomLevel>,
+        asset_type: Option<AssetType>,
+        in_reply_to: Option<OwnedEventId>,
+    ) -> Result<SendHandle, Error> {
+        let mut content = LocationMessageEventContent::new(body, geo_uri.clone());
+
+        if let Some(asset_type) = asset_type {
+            content = content.with_asset_type(asset_type);
+        }
+
+        let mut location = LocationContent::new(geo_uri);
+        location.description = description;
+        location.zoom_level = zoom_level;
+        content.location = Some(location);
+
+        let msgtype = MessageType::Location(content);
+
+        match in_reply_to {
+            Some(event_id) => {
+                self.send_reply(RoomMessageEventContentWithoutRelation::new(msgtype), event_id)
+                    .await
+            }
+            None => self.send(RoomMessageEventContent::new(msgtype).into()).await,
+        }
     }
 
     /// Given a message or media to send, and an optional `in_reply_to` event,
     /// automatically fills the [`Reply`] information based on the current
     /// timeline focus.
     pub(crate) async fn infer_reply(&self, in_reply_to: Option<OwnedEventId>) -> Option<Reply> {
-        // If there's a replied-to event id, the reply is pretty straightforward, and we
-        // should only infer the `EnforceThread` based on the current focus.
+        // If there's a replied-to event id, the reply is pretty
+        // straightforward, and we should only infer the `EnforceThread` based
+        // on the current focus.
         if let Some(in_reply_to) = in_reply_to {
             let enforce_thread = if self.controller.is_threaded() {
                 EnforceThread::Threaded(ReplyWithinThread::Yes)
@@ -430,14 +542,14 @@ impl Timeline {
 
         let thread_root = self.controller.thread_root()?;
 
-        // The latest event id is used for the reply-to fallback, for clients which
-        // don't handle threads. It should be correctly set to the latest
-        // event in the thread, which the timeline instance might or might
-        // not know about; in this case, we do a best effort of filling it, and resort
-        // to using the thread root if we don't know about any event.
+        // The latest event id is used for the reply-to fallback, for clients
+        // which don't handle threads. It should be correctly set to the latest
+        // event in the thread, which the timeline instance might or might not
+        // know about; in this case, we do a best effort of filling it, and
+        // resort to using the thread root if we don't know about any event.
         //
-        // Note: we could trigger a back-pagination if the timeline is empty, and wait
-        // for the results, if the timeline is too often empty.
+        // Note: we could trigger a back-pagination if the timeline is empty,
+        // and wait for the results, if the timeline is too often empty.
 
         let latest_event_id = self
             .controller
@@ -488,11 +600,15 @@ impl Timeline {
             }
 
             TimelineItemHandle::Local(handle) => {
-                // Relations are filled by the editing code itself.
                 let new_content: AnyMessageLikeEventContent = match new_content {
                     EditedContent::RoomMessage(message) => {
                         if item.content.is_message() {
-                            AnyMessageLikeEventContent::RoomMessage(message.into())
+                            // The replacement becomes the pending event itself,
+                            // so restore its relations, which the payload can't
+                            // carry by type.
+                            AnyMessageLikeEventContent::RoomMessage(
+                                message.with_relation(item.content.relation()),
+                            )
                         } else {
                             return Err(EditError::ContentMismatch {
                                 original: item.content.debug_string().to_owned(),
@@ -555,7 +671,23 @@ impl Timeline {
         item_id: &TimelineEventItemId,
         reaction_key: &str,
     ) -> Result<bool, Error> {
-        self.controller.toggle_reaction_local(item_id, reaction_key).await
+        self.controller.toggle_reaction_local(item_id, reaction_key, None).await
+    }
+
+    /// Same as [`Timeline::toggle_reaction`], merging `extra_content`'s fields
+    /// into the reaction's content when one is added.
+    ///
+    /// The reaction's own fields take precedence on conflicts. Removing a
+    /// reaction is a redaction, which carries no content, so `extra_content` is
+    /// only used when adding one — and only for reactions to remote events,
+    /// since a local echo is the user's own not-yet-sent event.
+    pub async fn toggle_reaction_with_extra_content(
+        &self,
+        item_id: &TimelineEventItemId,
+        reaction_key: &str,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<bool, Error> {
+        self.controller.toggle_reaction_local(item_id, reaction_key, extra_content).await
     }
 
     /// Sends an attachment to the room.
@@ -573,11 +705,9 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `source` - The source of the attachment to send.
-    ///
-    /// * `mime_type` - The attachment's mime type.
-    ///
-    /// * `config` - An attachment configuration object containing details about
+    /// - `source` - The source of the attachment to send.
+    /// - `mime_type` - The attachment's mime type.
+    /// - `config` - An attachment configuration object containing details about
     ///   the attachment like a thumbnail, its size, duration etc.
     ///
     /// [`Media::get_media_content()`]: matrix_sdk::Media::get_media_content
@@ -589,6 +719,42 @@ impl Timeline {
         config: AttachmentConfig,
     ) -> SendAttachment<'_> {
         SendAttachment::new(self, source.into(), mime_type, config)
+    }
+
+    /// Replaces the attachment of a message the current user sent, or adds one
+    /// to a message which had none, through the send queue.
+    ///
+    /// See [`RoomSendQueue::edit_with_attachment()`] for the details. The
+    /// `in_reply_to` of the `config` is ignored: an edit carries no other
+    /// relation.
+    ///
+    /// [`RoomSendQueue::edit_with_attachment()`]: matrix_sdk::send_queue::RoomSendQueue::edit_with_attachment
+    #[instrument(skip_all, fields(%event_id))]
+    pub async fn edit_with_attachment(
+        &self,
+        event_id: &EventId,
+        source: impl Into<AttachmentSource>,
+        mime_type: Mime,
+        config: AttachmentConfig,
+    ) -> Result<(), Error> {
+        let (data, filename) = source.into().try_into_bytes_and_filename()?;
+
+        let config = matrix_sdk::attachment::AttachmentConfig {
+            txn_id: config.txn_id,
+            info: config.info,
+            thumbnail: config.thumbnail,
+            caption: config.caption,
+            mentions: config.mentions,
+            extra_content: config.extra_content,
+            reply: None,
+        };
+
+        self.room()
+            .send_queue()
+            .edit_with_attachment(event_id, filename, mime_type, data, config)
+            .await?;
+
+        Ok(())
     }
 
     /// Sends a media gallery to the room.
@@ -603,7 +769,8 @@ impl Timeline {
     /// `MediaFormat::File`.
     ///
     /// # Arguments
-    /// * `gallery` - A configuration object containing details about the
+    ///
+    /// - `gallery` - A configuration object containing details about the
     ///   gallery like files, thumbnails, etc.
     ///
     /// [`Media::get_media_content()`]: matrix_sdk::Media::get_media_content
@@ -627,23 +794,69 @@ impl Timeline {
 
         match event.handle() {
             TimelineItemHandle::Remote(event_id) => {
-                self.room().redact(event_id, reason, None).await.map_err(RedactError::HttpError)?;
+                self.room()
+                    .send_queue()
+                    .redact(event_id.to_owned(), reason)
+                    .await
+                    .map_err(|_| Error::FailedSendingRedaction)?;
+                Ok(())
             }
             TimelineItemHandle::Local(handle) => {
-                if !handle.abort().await.map_err(RoomSendQueueError::StorageError)? {
+                // Forward the reason: if the local echo was being sent and the
+                // send wins the race, the server-side redaction that
+                // materializes the abort carries it.
+                if !handle
+                    .abort_with_reason(reason.map(ToOwned::to_owned))
+                    .await
+                    .map_err(RoomSendQueueError::StorageError)?
+                {
                     return Err(RedactError::InvalidLocalEchoState.into());
                 }
+                Ok(())
             }
         }
+    }
 
-        Ok(())
+    /// Retry sending something on this item that failed, see [`SendTarget`].
+    ///
+    /// Only needed after an unrecoverable failure, which parks the request
+    /// until it's retried or aborted; a recoverable one goes out again when the
+    /// room's send queue is re-enabled.
+    ///
+    /// Returns `false` if there was nothing of that kind left to retry, e.g.
+    /// because it went out in the meantime.
+    pub async fn retry_send(
+        &self,
+        item_id: &TimelineEventItemId,
+        target: SendTarget,
+    ) -> Result<bool, Error> {
+        let Some(handle) = self.controller.pending_send_handle(item_id, target).await? else {
+            return Ok(false);
+        };
+        handle.unwedge().await?;
+        Ok(true)
+    }
+
+    /// Abort sending something on this item that hasn't gone out yet, see
+    /// [`SendTarget`].
+    ///
+    /// Returns `false` if there was nothing of that kind left to abort, e.g.
+    /// because it went out in the meantime.
+    pub async fn abort_send(
+        &self,
+        item_id: &TimelineEventItemId,
+        target: SendTarget,
+    ) -> Result<bool, Error> {
+        let Some(handle) = self.controller.pending_send_handle(item_id, target).await? else {
+            return Ok(false);
+        };
+        handle.abort().await.map_err(|err| Error::SendQueueError(err.into()))
     }
 
     /// Fetch unavailable details about the event with the given ID.
     ///
-    /// This method only works for IDs of remote [`EventTimelineItem`]s,
-    /// to prevent losing details when a local echo is replaced by its
-    /// remote echo.
+    /// This method only works for IDs of remote [`EventTimelineItem`]s, to
+    /// prevent losing details when a local echo is replaced by its remote echo.
     ///
     /// This method tries to make all the requests it can. If an error is
     /// encountered for a given request, it is forwarded with the
@@ -651,7 +864,7 @@ impl Timeline {
     ///
     /// # Arguments
     ///
-    /// * `event_id` - The event ID of the event to fetch details for.
+    /// - `event_id` - The event ID of the event to fetch details for.
     ///
     /// # Errors
     ///
@@ -668,8 +881,8 @@ impl Timeline {
     /// If the full member list is not known, sender profiles are currently
     /// likely not going to be available. This will be fixed in the future.
     ///
-    /// If fetching the members fails, any affected timeline items will have
-    /// the `sender_profile` set to [`TimelineDetails::Error`].
+    /// If fetching the members fails, any affected timeline items will have the
+    /// `sender_profile` set to [`TimelineDetails::Error`].
     #[instrument(skip_all)]
     pub async fn fetch_members(&self) {
         self.controller.set_sender_profiles_pending().await;
@@ -718,15 +931,15 @@ impl Timeline {
 
     /// Send the given receipt.
     ///
-    /// This uses [`Room::send_single_receipt`] internally, but checks
-    /// first if the receipt points to an event in this timeline that is more
-    /// recent than the current ones, to avoid unnecessary requests.
+    /// This uses [`Room::send_single_receipt`] internally, but checks first if
+    /// the receipt points to an event in this timeline that is more recent than
+    /// the current ones, to avoid unnecessary requests.
     ///
     /// If an unthreaded receipt is sent, this will also unset the unread flag
     /// of the room if necessary.
     ///
-    /// The thread of the receipt is determined by the timeline instance's
-    /// focus mode and `hide_threaded_events` flag.
+    /// The thread of the receipt is determined by the timeline instance's focus
+    /// mode and `hide_threaded_events` flag.
     ///
     /// Returns a boolean indicating if it sent the receipt or not.
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
@@ -735,20 +948,40 @@ impl Timeline {
         receipt_type: ReceiptType,
         event_id: OwnedEventId,
     ) -> Result<bool> {
+        self.send_single_receipt_inner(receipt_type, event_id, false).await
+    }
+
+    /// Same as [`Self::send_single_receipt`], but lets the caller state whether
+    /// this is part of marking the whole room as read.
+    ///
+    /// When it is, and the only candidate event is one of the user's own, a
+    /// receipt is still sent against it so the homeserver recomputes its
+    /// push/badge count. See [`TimelineController::should_send_receipt`].
+    async fn send_single_receipt_inner(
+        &self,
+        receipt_type: ReceiptType,
+        event_id: OwnedEventId,
+        is_marking_room_as_read: bool,
+    ) -> Result<bool> {
         let thread = self.controller.infer_thread_for_read_receipt(&receipt_type);
 
-        if !self.controller.should_send_receipt(&receipt_type, &thread, &event_id).await {
-            trace!(
-                "not sending receipt, because we already cover the event with a previous receipt"
-            );
+        let event_id = match self
+            .controller
+            .should_send_receipt(&receipt_type, &thread, &event_id, is_marking_room_as_read)
+            .await
+        {
+            SendReceiptDecision::SendTo(event_id) => event_id,
+            SendReceiptDecision::DoNotSend => {
+                trace!("not sending receipt, because it wouldn't move the real receipt forwards");
 
-            if thread == ReceiptThread::Unthreaded {
-                // Unset the read marker.
-                self.room().set_unread_flag(false).await?;
+                if thread == ReceiptThread::Unthreaded {
+                    // Unset the read marker.
+                    self.room().set_unread_flag(false).await?;
+                }
+
+                return Ok(false);
             }
-
-            return Ok(false);
-        }
+        };
 
         trace!("sending receipt");
         self.room().send_single_receipt(receipt_type, thread, event_id).await?;
@@ -757,47 +990,59 @@ impl Timeline {
 
     /// Send the given receipts.
     ///
-    /// This uses [`Room::send_multiple_receipts`] internally, but
-    /// checks first if the receipts point to events in this timeline that
-    /// are more recent than the current ones, to avoid unnecessary
-    /// requests.
+    /// This uses [`Room::send_multiple_receipts`] internally, but checks first
+    /// if the receipts point to events in this timeline that are more recent
+    /// than the current ones, to avoid unnecessary requests.
     ///
     /// This also unsets the unread marker of the room if necessary.
     #[instrument(skip(self))]
     pub async fn send_multiple_receipts(&self, mut receipts: Receipts) -> Result<()> {
-        if let Some(fully_read) = &receipts.fully_read
-            && !self
+        if let Some(fully_read) = &receipts.fully_read {
+            receipts.fully_read = match self
                 .controller
                 .should_send_receipt(
                     &ReceiptType::FullyRead,
                     &ReceiptThread::Unthreaded,
                     fully_read,
+                    false,
                 )
                 .await
-        {
-            receipts.fully_read = None;
+            {
+                SendReceiptDecision::SendTo(event_id) => Some(event_id),
+                SendReceiptDecision::DoNotSend => None,
+            };
         }
 
-        if let Some(read_receipt) = &receipts.public_read_receipt
-            && !self
+        if let Some(read_receipt) = &receipts.public_read_receipt {
+            receipts.public_read_receipt = match self
                 .controller
-                .should_send_receipt(&ReceiptType::Read, &ReceiptThread::Unthreaded, read_receipt)
+                .should_send_receipt(
+                    &ReceiptType::Read,
+                    &ReceiptThread::Unthreaded,
+                    read_receipt,
+                    false,
+                )
                 .await
-        {
-            receipts.public_read_receipt = None;
+            {
+                SendReceiptDecision::SendTo(event_id) => Some(event_id),
+                SendReceiptDecision::DoNotSend => None,
+            };
         }
 
-        if let Some(private_read_receipt) = &receipts.private_read_receipt
-            && !self
+        if let Some(private_read_receipt) = &receipts.private_read_receipt {
+            receipts.private_read_receipt = match self
                 .controller
                 .should_send_receipt(
                     &ReceiptType::ReadPrivate,
                     &ReceiptThread::Unthreaded,
                     private_read_receipt,
+                    false,
                 )
                 .await
-        {
-            receipts.private_read_receipt = None;
+            {
+                SendReceiptDecision::SendTo(event_id) => Some(event_id),
+                SendReceiptDecision::DoNotSend => None,
+            };
         }
 
         let room = self.room();
@@ -815,13 +1060,13 @@ impl Timeline {
     /// latest visible event.
     ///
     /// The latest visible event is determined from the timeline's focus kind
-    /// and whether or not it hides threaded events. If no latest event can
-    /// be determined and the timeline is live, the room's unread marker is
-    /// unset instead.
+    /// and whether or not it hides threaded events. If no latest event can be
+    /// determined and the timeline is live, the room's unread marker is unset
+    /// instead.
     ///
     /// # Arguments
     ///
-    /// * `receipt_type` - The type of receipt to send. When using
+    /// - `receipt_type` - The type of receipt to send. When using
     ///   [`ReceiptType::FullyRead`], an unthreaded receipt will be sent. This
     ///   works even if the latest event belongs to a thread, as a threaded
     ///   reply also belongs to the unthreaded timeline. Otherwise the
@@ -834,7 +1079,7 @@ impl Timeline {
     #[instrument(skip(self), fields(room_id = ?self.room().room_id()))]
     pub async fn mark_as_read(&self, receipt_type: ReceiptType) -> Result<bool> {
         if let Some(event_id) = self.controller.latest_event_id().await {
-            self.send_single_receipt(receipt_type, event_id).await
+            self.send_single_receipt_inner(receipt_type, event_id, true).await
         } else {
             trace!("can't mark room as read because there's no latest event id");
 
@@ -965,6 +1210,7 @@ pub struct GalleryConfig {
     pub(crate) caption: Option<TextMessageEventContent>,
     pub(crate) mentions: Option<Mentions>,
     pub(crate) in_reply_to: Option<OwnedEventId>,
+    pub(crate) extra_content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[cfg(feature = "unstable-msc4274")]
@@ -978,7 +1224,7 @@ impl GalleryConfig {
     ///
     /// # Arguments
     ///
-    /// * `txn_id` - A unique ID that can be attached to a `MessageEvent` held
+    /// - `txn_id` - A unique ID that can be attached to a `MessageEvent` held
     ///   in its unsigned field as `transaction_id`. If not given, one is
     ///   created for the message.
     #[must_use]
@@ -1028,6 +1274,20 @@ impl GalleryConfig {
         self
     }
 
+    /// Set additional top-level fields for the gallery event's content.
+    ///
+    /// Objects are merged recursively; the event's own fields take precedence
+    /// on conflicts. To add fields to individual items, use
+    /// [`GalleryItemInfo::extra_content`].
+    #[must_use]
+    pub fn extra_content(
+        mut self,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
+        self.extra_content = extra_content;
+        self
+    }
+
     /// Returns the number of media items in the gallery.
     pub fn len(&self) -> usize {
         self.items.len()
@@ -1053,6 +1313,10 @@ pub struct GalleryItemInfo {
     pub caption: Option<TextMessageEventContent>,
     /// The thumbnail.
     pub thumbnail: Option<Thumbnail>,
+    /// Additional fields to merge into this item's content, for example a
+    /// spoiler flag. Objects are merged recursively; the item's own fields take
+    /// precedence on conflicts.
+    pub extra_content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[cfg(feature = "unstable-msc4274")]
@@ -1068,6 +1332,7 @@ impl TryFrom<GalleryItemInfo> for matrix_sdk::attachment::GalleryItemInfo {
             attachment_info: value.attachment_info,
             caption: value.caption,
             thumbnail: value.thumbnail,
+            extra_content: value.extra_content,
         })
     }
 }

@@ -35,7 +35,7 @@ use matrix_sdk::{
     test_utils::mocks::MatrixMockServer,
 };
 use matrix_sdk_base::{RoomInfo, RoomState, crypto::types::events::CryptoContextInfo};
-use matrix_sdk_test::{ALICE, DEFAULT_TEST_ROOM_ID, event_factory::EventFactory};
+use matrix_sdk_test::{DEFAULT_TEST_ROOM_ID, User, event_factory::EventFactory};
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedRoomId, OwnedTransactionId,
     OwnedUserId, RoomId, TransactionId, UInt, UserId,
@@ -43,7 +43,7 @@ use ruma::{
         AnyMessageLikeEventContent, AnyTimelineEvent,
         reaction::ReactionEventContent,
         receipt::{Receipt, ReceiptThread, ReceiptType},
-        relation::Annotation,
+        relation::{Annotation, RelationType},
     },
     room_id,
     room_version_rules::RoomVersionRules,
@@ -122,13 +122,10 @@ impl TestTimelineBuilder {
         let client = server.client_builder().build().await;
         let _room = server.sync_joined_room(&client, room_data_provider.room_id()).await;
 
-        let event_cache = client.event_cache();
-        event_cache.subscribe().unwrap();
-
         let controller = TimelineController::new(
             room_data_provider,
             &self.focus.unwrap_or(TimelineFocus::Live { hide_threaded_events: false }),
-            event_cache,
+            client.event_cache().expect("The `EventCache` must be enabled to use the `Timeline`"),
             self.internal_id_prefix,
             self.utd_hook,
             self.is_room_encrypted,
@@ -194,7 +191,7 @@ impl TestTimeline {
 
     async fn handle_local_redaction(&self, redacts: OwnedEventId) -> OwnedTransactionId {
         let txn_id = TransactionId::new();
-        self.controller.handle_local_redaction(txn_id.clone(), redacts).await;
+        self.controller.handle_local_redaction(txn_id.clone(), redacts, None).await;
         txn_id
     }
 
@@ -210,11 +207,11 @@ impl TestTimeline {
 
     async fn handle_read_receipts(
         &self,
-        receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, OwnedUserId, ReceiptThread)>,
+        receipts: impl IntoIterator<Item = (OwnedEventId, ReceiptType, User, ReceiptThread)>,
     ) {
         let mut read_receipt = self.factory.read_receipts();
-        for (event_id, tyype, user_id, thread) in receipts {
-            read_receipt = read_receipt.add(&event_id, &user_id, tyype, thread);
+        for (event_id, tyype, user, thread) in receipts {
+            read_receipt = read_receipt.add(&event_id, user, tyype, thread);
         }
         let ev_content = read_receipt.into_content();
         self.controller.handle_read_receipts(ev_content).await;
@@ -225,7 +222,16 @@ impl TestTimeline {
         item_id: &TimelineEventItemId,
         key: &str,
     ) -> Result<(), super::Error> {
-        if self.controller.toggle_reaction_local(item_id, key).await? {
+        self.toggle_reaction_local_with_extra_content(item_id, key, None).await
+    }
+
+    async fn toggle_reaction_local_with_extra_content(
+        &self,
+        item_id: &TimelineEventItemId,
+        key: &str,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(), super::Error> {
+        if self.controller.toggle_reaction_local(item_id, key, extra_content).await? {
             let items = self.controller.items().await;
             if let Some(event_id) = rfind_event_by_item_id(&items, item_id)
                 .and_then(|(_pos, item)| item.event_id().map(ToOwned::to_owned))
@@ -256,6 +262,8 @@ impl TestTimeline {
 type ReadReceiptMap =
     HashMap<ReceiptType, HashMap<ReceiptThread, HashMap<OwnedUserId, (OwnedEventId, Receipt)>>>;
 
+type ExtraContent = serde_json::Map<String, serde_json::Value>;
+
 #[derive(Clone, Debug, Default)]
 struct TestRoomDataProvider {
     /// The room ID.
@@ -276,6 +284,9 @@ struct TestRoomDataProvider {
 
     /// Events sent with that room data provider.
     pub sent_events: Arc<RwLock<Vec<AnyMessageLikeEventContent>>>,
+
+    /// Extra content sent alongside each event in [`Self::sent_events`].
+    pub sent_extra_content: Arc<RwLock<Vec<Option<ExtraContent>>>>,
 
     /// Events redacted with that room data providier.
     pub redacted: Arc<RwLock<Vec<OwnedEventId>>>,
@@ -331,7 +342,7 @@ impl RoomDataProvider for TestRoomDataProvider {
     }
 
     fn own_user_id(&self) -> &UserId {
-        self.own_user_id.as_deref().unwrap_or(&ALICE)
+        self.own_user_id.as_deref().unwrap_or_else(|| User::Alice.into())
     }
 
     fn room_version_rules(&self) -> RoomVersionRules {
@@ -357,12 +368,12 @@ impl RoomDataProvider for TestRoomDataProvider {
     async fn load_user_receipt<'a>(
         &'a self,
         receipt_type: ReceiptType,
-        thread: ReceiptThread,
+        thread: &'a ReceiptThread,
         user_id: &'a UserId,
     ) -> Option<(OwnedEventId, Receipt)> {
         self.initial_user_receipts
             .get(&receipt_type)
-            .and_then(|thread_map| thread_map.get(&thread))
+            .and_then(|thread_map| thread_map.get(thread))
             .and_then(|user_map| user_map.get(user_id))
             .cloned()
     }
@@ -370,7 +381,7 @@ impl RoomDataProvider for TestRoomDataProvider {
     async fn load_event_receipts<'a>(
         &'a self,
         event_id: &'a EventId,
-        _receipt_thread: ReceiptThread,
+        _receipt_thread: &'a ReceiptThread,
     ) -> IndexMap<OwnedUserId, Receipt> {
         let mut map = IndexMap::new();
 
@@ -389,8 +400,13 @@ impl RoomDataProvider for TestRoomDataProvider {
         self.fully_read_marker.clone()
     }
 
-    async fn send(&self, content: AnyMessageLikeEventContent) -> Result<(), super::Error> {
+    async fn send(
+        &self,
+        content: AnyMessageLikeEventContent,
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(), super::Error> {
         self.sent_events.write().await.push(content);
+        self.sent_extra_content.write().await.push(extra_content);
         Ok(())
     }
 
@@ -410,6 +426,14 @@ impl RoomDataProvider for TestRoomDataProvider {
     }
 
     async fn load_event<'a>(&'a self, _event_id: &'a EventId) -> matrix_sdk::Result<TimelineEvent> {
+        unimplemented!();
+    }
+
+    async fn load_or_fetch_event_with_relations<'a>(
+        &'a self,
+        _event_id: &'a EventId,
+        _filter: Option<Vec<RelationType>>,
+    ) -> matrix_sdk::Result<(TimelineEvent, Vec<TimelineEvent>)> {
         unimplemented!();
     }
 }

@@ -49,9 +49,9 @@ mod spiral_get_presence {
     use matrix_sdk::ruma::{
         OwnedUserId,
         api::{
-            EmptyBody, EndpointError, IncomingResponse, Metadata, OutgoingRequest,
+            EmptyBody, IncomingResponse, Metadata, OutgoingRequest,
             auth_scheme::AccessToken,
-            error::{Error as ClientApiError, FromHttpResponseError, IntoHttpError},
+            error::{DeserializationError, Error as ClientApiError, IntoHttpError},
             path_builder::PathBuilder,
         },
         exports::{
@@ -110,18 +110,12 @@ mod spiral_get_presence {
     impl IncomingResponse for PresenceResponse {
         type EndpointError = ClientApiError;
 
-        fn try_from_http_response<T: AsRef<[u8]>>(
-            response: Response<T>,
-        ) -> Result<Self, FromHttpResponseError<Self::EndpointError>> {
-            // As ruma's generated responses do: an error status is the
-            // server's error, parsed as a client API error (403 stays the
-            // typed `M_FORBIDDEN`).
-            if response.status().as_u16() >= 400 {
-                return Err(FromHttpResponseError::Server(ClientApiError::from_http_response(
-                    response,
-                )));
-            }
-            Ok(serde_json::from_slice(response.body().as_ref())?)
+        // ruma answers an error status itself, as the server's client API
+        // error (403 stays the typed `M_FORBIDDEN`); only a success gets here.
+        fn try_from_http_response_inner(
+            response: Response<&[u8]>,
+        ) -> Result<Self, DeserializationError> {
+            Ok(serde_json::from_slice(response.body())?)
         }
     }
 }

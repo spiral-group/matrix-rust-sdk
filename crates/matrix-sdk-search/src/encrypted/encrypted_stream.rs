@@ -13,9 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file originates from the rust-aes-stream repo[1], it has been moddified
-// to use AES-CTR mode and to authenticate the encrypted files.
-// [1] https://github.com/oberien/rust-aes-stream/
+// This file originates from [the `rust-aes-stream` repository][1], it has been
+// modified to use AES-CTR mode and to authenticate the encrypted files.
+//
+// [1]: https://github.com/oberien/rust-aes-stream/
 
 //! Read/Write Wrapper for AES Encryption and Decryption during I/O Operations
 use std::{
@@ -61,10 +62,10 @@ impl<
     ///
     /// # Arguments
     ///
-    /// * `writer`: Writer to write encrypted data into
-    /// * `key`: The encryption key for the stream cipher.
-    /// * `mac_key`: The authentication key for the MAC.
-    /// * `iv_size`: The size of the initialization vector or nonce for the
+    /// - `writer`: Writer to write encrypted data into
+    /// - `key`: The encryption key for the stream cipher.
+    /// - `mac_key`: The authentication key for the MAC.
+    /// - `iv_size`: The size of the initialization vector or nonce for the
     ///   stream cipher.
     pub fn new(
         mut writer: W,
@@ -76,7 +77,7 @@ impl<
         let mut rng = rng();
         rng.fill_bytes(&mut iv[0..iv_size / 2]);
 
-        let mac = <M as Mac>::new_from_slice(mac_key)
+        let mac = M::new_from_slice(mac_key)
             .map_err(|e| Error::other(format!("error creating mac: {:?}", e)))?;
 
         let enc = E::new_from_slices(key, &iv)
@@ -90,7 +91,7 @@ impl<
     ///
     /// # Arguments
     ///
-    /// * `buf`: Plaintext to encrypt and write.
+    /// - `buf`: Plaintext to encrypt and write.
     fn encrypt_write(&mut self, buf: &mut [u8]) -> Result<usize> {
         if self.finalized {
             return Err(Error::other("File has been already finalized"));
@@ -137,7 +138,8 @@ impl<
     }
 
     /// Flush this output stream, ensuring that all intermediately buffered
-    /// contents reach their destination. [Read more](https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.flush)
+    /// contents reach their destination.
+    /// [Read more](https://doc.rust-lang.org/nightly/std/io/trait.Write.html#tymethod.flush)
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()
     }
@@ -183,10 +185,10 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `reader`: Reader to read encrypted data from
-    /// * `key`: The decryption key for the stream cipher.
-    /// * `mac_key`: The authentication key for the MAC.
-    /// * `iv_size`: The size of the initialization vector or nonce for the
+    /// - `reader`: Reader to read encrypted data from
+    /// - `key`: The decryption key for the stream cipher.
+    /// - `mac_key`: The authentication key for the MAC.
+    /// - `iv_size`: The size of the initialization vector or nonce for the
     ///   stream cipher.
     pub fn new<M: Mac + KeyInit + Update + FixedOutputReset>(
         mut reader: R,
@@ -197,7 +199,7 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ) -> Result<AesReader<D, R>> {
         let iv_length = iv_size;
 
-        let mut mac = <M as Mac>::new_from_slice(mac_key)
+        let mut mac = M::new_from_slice(mac_key)
             .map_err(|e| Error::other(format!("error creating mac: {:?}", e)))?;
 
         let mac_length = mac_size;
@@ -254,10 +256,10 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `buffer`: The buffer to fill.
-    /// * `reader`: Reader to read encrypted data from
-    /// * `total_length`: The total number of bytes that the reader contains.
-    /// * `mac_length`: The length of the MAC that is stored the file we are
+    /// - `buffer`: The buffer to fill.
+    /// - `reader`: Reader to read encrypted data from
+    /// - `total_length`: The total number of bytes that the reader contains.
+    /// - `mac_length`: The length of the MAC that is stored the file we are
     ///   reading from.
     fn read_until_mac(
         buffer: &mut [u8],
@@ -283,7 +285,7 @@ impl<D: StreamCipher + KeyIvInit, R: Read + Seek + Clone> AesReader<D, R> {
     ///
     /// # Arguments
     ///
-    /// * `buf`: Buffer to write decrypted data into.
+    /// - `buf`: Buffer to write decrypted data into.
     fn read_decrypt(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read =
             AesReader::<D, R>::read_until_mac(buf, &mut self.reader, self.length, self.mac_length)?;
@@ -308,7 +310,7 @@ mod tests {
     use std::io::{Cursor, Read, Seek, Write};
 
     use aes::Aes128;
-    use hmac::Hmac;
+    use hmac::HmacReset;
     use sha2::Sha256;
 
     use super::{AesReader, AesWriter};
@@ -322,7 +324,7 @@ mod tests {
         let mut enc = Vec::new();
         {
             let mut aes =
-                AesWriter::<Aes128Ctr, Hmac<Sha256>, _>::new(&mut enc, &key, &hmac_key, 16)
+                AesWriter::<Aes128Ctr, HmacReset<Sha256>, _>::new(&mut enc, &key, &hmac_key, 16)
                     .unwrap();
             aes.write_all(data).unwrap();
         }
@@ -333,7 +335,7 @@ mod tests {
         let key = [0u8; 16];
         let mut dec = Vec::new();
         let mut aes =
-            AesReader::<Aes128Ctr, _>::new::<Hmac<Sha256>>(data, &key, &key, 16, 32).unwrap();
+            AesReader::<Aes128Ctr, _>::new::<HmacReset<Sha256>>(data, &key, &key, 16, 32).unwrap();
         aes.read_to_end(&mut dec).unwrap();
         dec
     }
@@ -347,7 +349,7 @@ mod tests {
         let mut enc = Vec::new();
         {
             let mut aes =
-                AesWriter::<Aes128Ctr, Hmac<Sha256>, _>::new(&mut enc, &key, &hmac_key, 16)
+                AesWriter::<Aes128Ctr, HmacReset<Sha256>, _>::new(&mut enc, &key, &hmac_key, 16)
                     .unwrap();
             for chunk in orig.chunks(3) {
                 aes.write_all(chunk).unwrap();
@@ -380,9 +382,14 @@ mod tests {
 
         let key = [0u8; 16];
         let mut dec: Vec<u8> = Vec::new();
-        let mut aes =
-            AesReader::<Aes128Ctr, _>::new::<Hmac<Sha256>>(Cursor::new(&enc), &key, &key, 16, 32)
-                .unwrap();
+        let mut aes = AesReader::<Aes128Ctr, _>::new::<HmacReset<Sha256>>(
+            Cursor::new(&enc),
+            &key,
+            &key,
+            16,
+            32,
+        )
+        .unwrap();
         loop {
             let mut buf = [0u8; 3];
             let read = aes.read(&mut buf).unwrap();

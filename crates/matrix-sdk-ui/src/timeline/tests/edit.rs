@@ -14,21 +14,34 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use assert_matches2::assert_let;
+use assert_matches::assert_matches;
 use eyeball_im::VectorDiff;
-use matrix_sdk::deserialized_responses::{
-    AlgorithmInfo, EncryptionInfo, VerificationLevel, VerificationState,
+use matrix_sdk::{
+    deserialized_responses::{AlgorithmInfo, EncryptionInfo, VerificationLevel, VerificationState},
+    send_queue::AbstractProgress,
 };
-use matrix_sdk_base::deserialized_responses::{DecryptedRoomEvent, TimelineEvent};
-use matrix_sdk_test::{ALICE, BOB, async_test};
+use matrix_sdk_base::{
+    deserialized_responses::{DecryptedRoomEvent, TimelineEvent},
+    store::QueueWedgeError,
+};
+use matrix_sdk_test::{User, async_test};
 use ruma::{
-    event_id,
-    events::room::message::{MessageType, RedactedRoomMessageEventContent},
-    room_id,
+    EventId, event_id,
+    events::{
+        AnyMessageLikeEventContent,
+        relation::Replacement,
+        room::message::{
+            MessageType, RedactedRoomMessageEventContent, Relation, RoomMessageEventContent,
+            RoomMessageEventContentWithoutRelation,
+        },
+    },
+    owned_event_id, room_id,
 };
+use strass::assert_let;
 use stream_assert::{assert_next_matches, assert_pending};
 
 use super::TestTimeline;
+use crate::timeline::{EventSendState, MediaUploadProgress};
 
 #[async_test]
 async fn test_live_redacted() {
@@ -37,7 +50,9 @@ async fn test_live_redacted() {
 
     let f = &timeline.factory;
 
-    timeline.handle_live_event(f.redacted(*ALICE, RedactedRoomMessageEventContent::new())).await;
+    timeline
+        .handle_live_event(f.redacted(User::Alice, RedactedRoomMessageEventContent::new()))
+        .await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
     let redacted_event_id = item.as_event().unwrap().event_id().unwrap();
@@ -45,7 +60,7 @@ async fn test_live_redacted() {
     timeline
         .handle_live_event(
             f.text_msg(" * test")
-                .sender(&ALICE)
+                .sender(User::Alice)
                 .edit(redacted_event_id, MessageType::text_plain("test").into()),
         )
         .await;
@@ -64,7 +79,8 @@ async fn test_live_sanitized() {
     let f = &timeline.factory;
     timeline
         .handle_live_event(
-            f.text_html("**original** message", "<strong>original</strong> message").sender(&ALICE),
+            f.text_html("**original** message", "<strong>original</strong> message")
+                .sender(User::Alice),
         )
         .await;
 
@@ -85,7 +101,7 @@ async fn test_live_sanitized() {
     timeline
         .handle_live_event(
             f.text_html(format!("* {new_plain_content}"), format!("* {new_html_content}"))
-                .sender(&ALICE)
+                .sender(User::Alice)
                 .edit(
                     first_event_id,
                     MessageType::text_html(new_plain_content, new_html_content).into(),
@@ -113,7 +129,7 @@ async fn test_aggregated_sanitized() {
 
     let ev = f
         .text_html("**original** message", "<strong>original</strong> message")
-        .sender(*ALICE)
+        .sender(User::Alice)
         .event_id(original_event_id)
         .with_bundled_edit(
             f.text_html(
@@ -129,7 +145,7 @@ async fn test_aggregated_sanitized() {
                 .into(),
             )
             .event_id(edit_event_id)
-            .sender(*ALICE),
+            .sender(User::Alice),
         );
 
     timeline.handle_live_event(ev).await;
@@ -155,13 +171,13 @@ async fn test_edit_updates_encryption_info() {
 
     let original_event = event_factory
         .text_msg("**original** message")
-        .sender(*ALICE)
+        .sender(User::Alice)
         .event_id(original_event_id)
         .room(room_id)
         .into_raw();
 
     let mut encryption_info = Arc::new(EncryptionInfo {
-        sender: (*ALICE).into(),
+        sender: User::Alice.into(),
         sender_device: None,
         forwarder: None,
         algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
@@ -197,7 +213,7 @@ async fn test_edit_updates_encryption_info() {
 
     let edit_event = event_factory
         .text_msg(" * !!edited!! **better** message")
-        .sender(*ALICE)
+        .sender(User::Alice)
         .room(room_id)
         .edit(original_event_id, MessageType::text_plain("!!edited!! **better** message").into())
         .into_raw();
@@ -242,7 +258,7 @@ async fn test_relations_edit_overrides_pending_edit_msg() {
     timeline
         .handle_live_event(
             f.text_msg("*edit 1")
-                .sender(*ALICE)
+                .sender(User::Alice)
                 .edit(original_event_id, MessageType::text_plain("edit 1").into())
                 .event_id(edit1_event_id),
         )
@@ -250,12 +266,13 @@ async fn test_relations_edit_overrides_pending_edit_msg() {
     assert_pending!(stream);
 
     // Now we receive the original event, with a bundled relations group.
-    let ev = f.text_msg("original").sender(*ALICE).event_id(original_event_id).with_bundled_edit(
-        f.text_msg("* edit 2")
-            .edit(original_event_id, MessageType::text_plain("edit 2").into())
-            .event_id(edit2_event_id)
-            .sender(*ALICE),
-    );
+    let ev =
+        f.text_msg("original").sender(User::Alice).event_id(original_event_id).with_bundled_edit(
+            f.text_msg("* edit 2")
+                .edit(original_event_id, MessageType::text_plain("edit 2").into())
+                .event_id(edit2_event_id)
+                .sender(User::Alice),
+        );
 
     timeline.handle_live_event(ev).await;
 
@@ -301,7 +318,7 @@ async fn test_relations_edit_overrides_pending_edit_poll() {
                 "Can the fake slim shady please stand up?",
                 vec!["Excuse me?"],
             )
-            .sender(*ALICE)
+            .sender(User::Alice)
             .event_id(edit1_event_id),
         )
         .await;
@@ -314,7 +331,7 @@ async fn test_relations_edit_overrides_pending_edit_poll() {
             "Can the fake slim shady please stand down?",
             vec!["Excuse me?"],
         )
-        .sender(*ALICE)
+        .sender(User::Alice)
         .event_id(original_event_id)
         .with_bundled_edit(
             f.poll_edit(
@@ -322,7 +339,7 @@ async fn test_relations_edit_overrides_pending_edit_poll() {
                 "Can the real slim shady please stand up?",
                 vec!["Excuse me?", "Please stand up 🎵", "Please stand up 🎶"],
             )
-            .sender(*ALICE)
+            .sender(User::Alice)
             .event_id(edit2_event_id),
         );
 
@@ -362,7 +379,7 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
 
     // Start with a message event.
     let target = event_id!("$1");
-    timeline.handle_live_event(f.text_msg("hey").sender(&ALICE).event_id(target)).await;
+    timeline.handle_live_event(f.text_msg("hey").sender(User::Alice).event_id(target)).await;
 
     {
         let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
@@ -374,7 +391,7 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
     // Have someone send a reply.
     let reply = event_id!("$2");
     timeline
-        .handle_live_event(f.text_msg("hallo").sender(&BOB).reply_to(target).event_id(reply))
+        .handle_live_event(f.text_msg("hallo").sender(User::Bob).reply_to(target).event_id(reply))
         .await;
 
     {
@@ -388,7 +405,7 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
     timeline
         .handle_live_event(
             f.text_msg("* guten tag")
-                .sender(&BOB)
+                .sender(User::Bob)
                 .edit(reply, MessageType::text_plain("guten tag").into()),
         )
         .await;
@@ -404,7 +421,7 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
     timeline
         .handle_live_event(
             f.text_msg("* hello")
-                .sender(&ALICE)
+                .sender(User::Alice)
                 .edit(target, MessageType::text_plain("hello").into()),
         )
         .await;
@@ -419,6 +436,175 @@ async fn test_updated_reply_doesnt_lose_latest_edit() {
     // And still has the latest edit JSON.
     assert!(item.latest_edit_json().is_some());
     assert_eq!(item.content().as_message().unwrap().body(), "guten tag");
+
+    assert_pending!(stream);
+}
+
+fn failed_state() -> EventSendState {
+    EventSendState::SendingFailed {
+        error: Arc::new(matrix_sdk::Error::SendQueueWedgeError(Box::new(
+            QueueWedgeError::GenericApiError { msg: "nope".to_owned() },
+        ))),
+        is_recoverable: false,
+    }
+}
+
+fn local_edit(original: &EventId, body: &str) -> AnyMessageLikeEventContent {
+    let mut content = RoomMessageEventContent::text_plain(format!("* {body}"));
+    content.relates_to = Some(Relation::Replacement(Replacement::new(
+        original.to_owned(),
+        RoomMessageEventContentWithoutRelation::text_plain(body),
+    )));
+    AnyMessageLikeEventContent::RoomMessage(content)
+}
+
+#[async_test]
+async fn test_local_edit_send_state_transitions() {
+    let timeline = TestTimeline::new().await;
+    let mut stream = timeline.subscribe_events().await;
+    let f = &timeline.factory;
+
+    let original_id = event_id!("$original");
+    timeline.handle_live_event(f.text_msg("hello").sender(User::Alice).event_id(original_id)).await;
+    let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
+    assert!(item.edit_send_state().is_none());
+
+    // A pending local edit is applied and exposed as not sent yet.
+    let txn_id = timeline.handle_local_event(local_edit(original_id, "edited")).await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    let msg = item.content().as_message().unwrap();
+    assert_eq!(msg.body(), "edited");
+    assert_matches!(item.edit_send_state(), Some(EventSendState::NotSentYet { progress: None }));
+
+    // Upload progress lands on the edit.
+    timeline
+        .controller
+        .update_event_send_state(
+            &txn_id,
+            EventSendState::NotSentYet {
+                progress: Some(MediaUploadProgress {
+                    index: 0,
+                    progress: AbstractProgress { current: 1, total: 2 },
+                }),
+            },
+        )
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(item.edit_send_state(), Some(EventSendState::NotSentYet { progress: Some(_) }));
+
+    // A failure is exposed, the edited content stays.
+    timeline.controller.update_event_send_state(&txn_id, failed_state()).await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    let msg = item.content().as_message().unwrap();
+    assert_eq!(msg.body(), "edited");
+    assert_matches!(
+        item.edit_send_state(),
+        Some(EventSendState::SendingFailed { is_recoverable: false, .. })
+    );
+
+    // A retry resets it.
+    timeline
+        .controller
+        .update_event_send_state(&txn_id, EventSendState::NotSentYet { progress: None })
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(item.edit_send_state(), Some(EventSendState::NotSentYet { progress: None }));
+
+    // Sent.
+    let edit_id = event_id!("$edit");
+    timeline
+        .controller
+        .update_event_send_state(&txn_id, EventSendState::Sent { event_id: edit_id.to_owned() })
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(item.edit_send_state(), Some(EventSendState::Sent { .. }));
+
+    // The remote echo of the edit clears it.
+    timeline
+        .handle_live_event(
+            f.text_msg("* edited")
+                .sender(User::Alice)
+                .edit(original_id, MessageType::text_plain("edited").into())
+                .event_id(edit_id),
+        )
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    let msg = item.content().as_message().unwrap();
+    assert_eq!(msg.body(), "edited");
+    assert!(msg.is_edited());
+    assert!(item.edit_send_state().is_none());
+
+    assert_pending!(stream);
+}
+
+#[async_test]
+async fn test_failed_edit_wins_over_a_later_pending_edit() {
+    let timeline = TestTimeline::new().await;
+    let mut stream = timeline.subscribe_events().await;
+    let f = &timeline.factory;
+
+    let original_id = event_id!("$original");
+    timeline.handle_live_event(f.text_msg("hello").sender(User::Alice).event_id(original_id)).await;
+    assert_next_matches!(stream, VectorDiff::PushBack { .. });
+
+    let first = timeline.handle_local_event(local_edit(original_id, "first")).await;
+    assert_next_matches!(stream, VectorDiff::Set { index: 0, .. });
+    let _second = timeline.handle_local_event(local_edit(original_id, "second")).await;
+    assert_next_matches!(stream, VectorDiff::Set { index: 0, .. });
+
+    // The first edit fails: it blocks the second one, so the item says failed.
+    timeline.controller.update_event_send_state(&first, failed_state()).await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(item.edit_send_state(), Some(EventSendState::SendingFailed { .. }));
+
+    // Once the first one is sent, the second one's pending state shows.
+    timeline
+        .controller
+        .update_event_send_state(&first, EventSendState::Sent { event_id: owned_event_id!("$e1") })
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    assert_matches!(item.edit_send_state(), Some(EventSendState::NotSentYet { .. }));
+
+    assert_pending!(stream);
+}
+
+#[async_test]
+async fn test_edit_remote_echo_before_sent_leaves_no_pending_state() {
+    let timeline = TestTimeline::new().await;
+    let mut stream = timeline.subscribe_events().await;
+    let f = &timeline.factory;
+
+    let original_id = event_id!("$original");
+    timeline.handle_live_event(f.text_msg("hello").sender(User::Alice).event_id(original_id)).await;
+    assert_next_matches!(stream, VectorDiff::PushBack { .. });
+
+    let txn_id = timeline.handle_local_event(local_edit(original_id, "edited")).await;
+    assert_next_matches!(stream, VectorDiff::Set { index: 0, .. });
+
+    // The remote echo of the edit arrives before the send queue reports the
+    // send.
+    let edit_id = event_id!("$edit");
+    timeline
+        .handle_live_event(
+            f.text_msg("* edited")
+                .sender(User::Alice)
+                .edit(original_id, MessageType::text_plain("edited").into())
+                .event_id(edit_id),
+        )
+        .await;
+    assert_next_matches!(stream, VectorDiff::Set { index: 0, .. });
+
+    // The late `Sent` lets the remote echo settle the item: nothing pending
+    // anymore.
+    timeline
+        .controller
+        .update_event_send_state(&txn_id, EventSendState::Sent { event_id: edit_id.to_owned() })
+        .await;
+    let item = assert_next_matches!(stream, VectorDiff::Set { index: 0, value } => value);
+    let msg = item.content().as_message().unwrap();
+    assert_eq!(msg.body(), "edited");
+    assert!(msg.is_edited());
+    assert!(item.edit_send_state().is_none());
 
     assert_pending!(stream);
 }

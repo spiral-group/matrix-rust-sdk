@@ -77,20 +77,14 @@ impl GuardedStoreAccess {
     }
 
     /// Saves the tokens in the database.
-    ///
-    /// Returns whether the list of tokens is empty or not.
     #[instrument(skip_all, fields(num_tokens = tokens.len()))]
-    async fn save_catchup_tokens(
-        &self,
-        tokens: Vec<ThreadSubscriptionCatchupToken>,
-    ) -> Result<bool> {
+    async fn save_catchup_tokens(&self, tokens: Vec<ThreadSubscriptionCatchupToken>) -> Result<()> {
         let store = self.client.state_store();
-        let is_empty = if tokens.is_empty() {
+        if tokens.is_empty() {
             store.remove_kv_data(StateStoreDataKey::ThreadSubscriptionsCatchupTokens).await?;
 
             trace!("Marking thread subscriptions as not outdated \\o/");
             self.is_outdated.store(false, atomic::Ordering::SeqCst);
-            true
         } else {
             store
                 .set_kv_data(
@@ -101,9 +95,9 @@ impl GuardedStoreAccess {
 
             trace!("Marking thread subscriptions as outdated.");
             self.is_outdated.store(true, atomic::Ordering::SeqCst);
-            false
-        };
-        Ok(is_empty)
+        }
+
+        Ok(())
     }
 }
 
@@ -130,7 +124,7 @@ pub struct ThreadSubscriptionCatchup {
 impl ThreadSubscriptionCatchup {
     pub async fn new(client: Client) -> Arc<Self> {
         let is_outdated = Arc::new(AtomicBool::new(true));
-        let weak_client = WeakClient::from_client(&client);
+        let weak_client = client.downgrade();
         let ping = Arc::new(Notify::new());
         let task_ping = Arc::clone(&ping);
         let uniq_mutex = Arc::new(Mutex::new(()));
@@ -222,40 +216,43 @@ impl ThreadSubscriptionCatchup {
         guard: &GuardedStoreAccess,
         token: Option<ThreadSubscriptionCatchupToken>,
     ) -> Result<()> {
-        // Note: saving an empty tokens list will mark the thread subscriptions list as
-        // not outdated.
+        // Note: saving an empty tokens list will mark the thread subscriptions
+        // list as not outdated.
         let mut tokens = guard.load_catchup_tokens().await?.unwrap_or_default();
 
         if let Some(token) = token {
-            trace!(?token, "Saving catchup token");
-            tokens.push(token);
+            // Gappy syncs on a busy account can cause the same catchup token to
+            // be sent repeatedly. We dedupe the tokens here to prevent
+            // duplicate catchup requests.
+            if tokens.contains(&token) {
+                trace!(?token, "Skipping duplicate catchup token");
+            } else {
+                trace!(?token, "Saving catchup token");
+                tokens.push(token);
+
+                guard.save_catchup_tokens(tokens).await?;
+
+                // Wake up the catchup task, in case it's waiting.
+                self.ping.notify_one();
+            }
         } else {
             trace!("No catchup token to save");
-        }
-
-        let is_token_list_empty = guard.save_catchup_tokens(tokens).await?;
-
-        // Wake up the catchup task, in case it's waiting.
-        if !is_token_list_empty {
-            self.ping.notify_one();
         }
 
         Ok(())
     }
 
     /// The background task listening to new catchup tokens, and using them to
-    /// catch up the thread subscriptions via the [MSC4308] companion
-    /// endpoint.
+    /// catch up the thread subscriptions via the [MSC4308] companion endpoint.
     ///
     /// It will continue to process catchup tokens until there are none, and
-    /// then wait for a new one to be available and inserted in the
-    /// database.
+    /// then wait for a new one to be available and inserted in the database.
     ///
     /// It always processes catch up tokens from the newest to the oldest, since
-    /// newest tokens are more interesting than older ones. Indeed, they're
-    /// more likely to include entries with higher bump-stamps, i.e. to include
-    /// more recent thread subscriptions statuses for each thread, so more
-    /// relevant information.
+    /// newest tokens are more interesting than older ones. Indeed, they're more
+    /// likely to include entries with higher bump-stamps, i.e. to include more
+    /// recent thread subscriptions statuses for each thread, so more relevant
+    /// information.
     ///
     /// [MSC4308]: https://github.com/matrix-org/matrix-spec-proposals/pull/4308
     #[instrument(skip_all)]
@@ -301,7 +298,8 @@ impl ThreadSubscriptionCatchup {
 
             match client.send(req).await {
                 Ok(resp) => {
-                    // Precompute the updates so we don't hold the guard for too long.
+                    // Precompute the updates so we don't hold the guard for too
+                    // long.
                     let updates = build_subscription_updates(&resp.subscribed, &resp.unsubscribed);
 
                     let guard = this
@@ -324,8 +322,8 @@ impl ThreadSubscriptionCatchup {
                         }
                     }
 
-                    // Refresh the tokens, as the list might have changed while we sent the
-                    // request.
+                    // Refresh the tokens, as the list might have changed while
+                    // we sent the request.
                     let mut tokens = match guard.load_catchup_tokens().await {
                         Ok(tokens) => tokens.unwrap_or_default(),
                         Err(err) => {
@@ -340,12 +338,14 @@ impl ThreadSubscriptionCatchup {
                     };
 
                     if let Some(next_batch) = resp.end {
-                        // If the response contained a next batch token, reuse the same catchup
-                        // token entry, so the `to` value remains the same.
+                        // If the response contained a next batch token, reuse
+                        // the same catchup token entry, so the `to` value
+                        // remains the same.
                         tokens[index] =
                             ThreadSubscriptionCatchupToken { from: next_batch, to: last.to };
                     } else {
-                        // No next batch, we can remove this token from the list.
+                        // No next batch, we can remove this token from the
+                        // list.
                         tokens.remove(index);
                     }
 
@@ -444,6 +444,25 @@ mod tests {
         // And we are not outdated anymore!
         assert!(tsc.is_outdated().not());
     }
+
+    #[async_test]
+    async fn test_save_catchup_token_deduplicates() {
+        let client = MockClientBuilder::new(None).build().await;
+
+        let tsc = client.thread_subscription_catchup();
+        let guard = tsc.lock().await.unwrap();
+
+        let token =
+            ThreadSubscriptionCatchupToken { from: "from".to_owned(), to: Some("to".to_owned()) };
+
+        // When the same catchup token is saved twice,
+        tsc.save_catchup_token(&guard, Some(token.clone())).await.unwrap();
+        tsc.save_catchup_token(&guard, Some(token.clone())).await.unwrap();
+
+        // Then it must only appear once in the stored list.
+        let tokens = guard.load_catchup_tokens().await.unwrap();
+        assert_eq!(tokens, Some(vec![token]));
+    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -454,7 +473,7 @@ mod timed_tests {
     use matrix_sdk_test::async_test;
     use tokio::task::yield_now;
 
-    use crate::{client::WeakClient, test_utils::mocks::MatrixMockServer};
+    use crate::test_utils::mocks::MatrixMockServer;
 
     #[async_test]
     async fn test_issue_6573_client_can_drop_thread_subscriptions_task() {
@@ -480,7 +499,7 @@ mod timed_tests {
         assert!(tsc._task.get().is_some());
 
         // Get a weak reference to the client.
-        let weak_client = WeakClient::from_client(&client);
+        let weak_client = client.downgrade();
 
         // Drop the client will drop the task.
         drop(client);

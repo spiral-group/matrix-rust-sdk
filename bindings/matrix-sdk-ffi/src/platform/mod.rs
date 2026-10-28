@@ -162,9 +162,9 @@ where
 }
 
 // Another fields formatter is necessary because of this bug
-// https://github.com/tokio-rs/tracing/issues/1372. Using a new
-// formatter for the fields forces to record them in different span
-// extensions, and thus remove the duplicated fields in the span.
+// https://github.com/tokio-rs/tracing/issues/1372. Using a new formatter for
+// the fields forces to record them in different span extensions, and thus
+// remove the duplicated fields in the span.
 #[derive(Default)]
 struct FieldsFormatterForFiles(DefaultFields);
 
@@ -263,9 +263,9 @@ fn make_file_layer(
     fmt::layer()
         .fmt_fields(FieldsFormatterForFiles::default())
         .event_format(EventFormatter::new())
-        // EventFormatter doesn't support ANSI colors anyways, but the
-        // default field formatter does, which is unhelpful for iOS +
-        // Android logs, but enabled by default.
+        // EventFormatter doesn't support ANSI colors anyways, but the default
+        // field formatter does, which is unhelpful for iOS + Android logs, but
+        // enabled by default.
         .with_ansi(false)
         .with_writer(writer)
 }
@@ -287,8 +287,8 @@ pub struct TracingFileConfiguration {
     /// Maximum total size of all log files combined in bytes.
     ///
     /// When the total size of all log files with the configured prefix and
-    /// suffix exceeds this limit, the oldest files will be removed until
-    /// the total is below the limit.
+    /// suffix exceeds this limit, the oldest files will be removed until the
+    /// total is below the limit.
     ///
     /// This is useful to prevent log files from consuming too much disk space
     /// over time, even with multiple rotated files.
@@ -299,8 +299,8 @@ pub struct TracingFileConfiguration {
     /// Maximum age of log files in seconds.
     ///
     /// Log files older than this age will be automatically removed during
-    /// cleanup. This is checked when the writer is created and during
-    /// rotation operations.
+    /// cleanup. This is checked when the writer is created and during rotation
+    /// operations.
     ///
     /// Default: 1 week (7 * 24 * 60 * 60 seconds) if not specified.
     max_age_seconds: Option<u64>,
@@ -328,8 +328,10 @@ enum LogTarget {
     MatrixSdk,
     MatrixSdkClient,
     MatrixSdkCrypto,
+    MatrixSdkCryptoIdentitiesManager,
     MatrixSdkCryptoAccount,
     MatrixSdkEventCache,
+    MatrixSdkEventCacheBackPagination,
     MatrixSdkEventCacheStore,
     MatrixSdkHttpClient,
     MatrixSdkLatestEvents,
@@ -340,6 +342,9 @@ enum LogTarget {
     // SDK UI modules.
     MatrixSdkUiTimeline,
     MatrixSdkUiNotificationClient,
+
+    // SDK search modules
+    MatrixSdkSearch,
 }
 
 impl LogTarget {
@@ -358,16 +363,21 @@ impl LogTarget {
             LogTarget::MatrixSdk => "matrix_sdk",
             LogTarget::MatrixSdkClient => "matrix_sdk::client",
             LogTarget::MatrixSdkCrypto => "matrix_sdk_crypto",
+            LogTarget::MatrixSdkCryptoIdentitiesManager => "matrix_sdk_crypto::identities::manager",
             LogTarget::MatrixSdkCryptoAccount => "matrix_sdk_crypto::olm::account",
             LogTarget::MatrixSdkOauth => "matrix_sdk::authentication::oauth",
             LogTarget::MatrixSdkHttpClient => "matrix_sdk::http_client",
             LogTarget::MatrixSdkSlidingSync => "matrix_sdk::sliding_sync",
             LogTarget::MatrixSdkEventCache => "matrix_sdk::event_cache",
+            LogTarget::MatrixSdkEventCacheBackPagination => {
+                "matrix_sdk::event_cache::back_pagination_queue"
+            }
             LogTarget::MatrixSdkLatestEvents => "matrix_sdk::latest_events",
             LogTarget::MatrixSdkSendQueue => "matrix_sdk::send_queue",
             LogTarget::MatrixSdkEventCacheStore => "matrix_sdk_sqlite::event_cache_store",
             LogTarget::MatrixSdkUiTimeline => "matrix_sdk_ui::timeline",
             LogTarget::MatrixSdkUiNotificationClient => "matrix_sdk_ui::notification_client",
+            LogTarget::MatrixSdkSearch => "matrix_sdk_search",
         }
     }
 }
@@ -378,6 +388,7 @@ const DEFAULT_TARGET_LOG_LEVELS: &[(LogTarget, LogLevel)] = &[
     (LogTarget::MatrixSdk, LogLevel::Info),
     (LogTarget::MatrixSdkClient, LogLevel::Trace),
     (LogTarget::MatrixSdkCrypto, LogLevel::Debug),
+    (LogTarget::MatrixSdkCryptoIdentitiesManager, LogLevel::Info),
     (LogTarget::MatrixSdkCryptoAccount, LogLevel::Trace),
     (LogTarget::MatrixSdkOauth, LogLevel::Trace),
     (LogTarget::MatrixSdkHttpClient, LogLevel::Debug),
@@ -386,6 +397,7 @@ const DEFAULT_TARGET_LOG_LEVELS: &[(LogTarget, LogLevel)] = &[
     (LogTarget::MatrixSdkUiTimeline, LogLevel::Info),
     (LogTarget::MatrixSdkSendQueue, LogLevel::Info),
     (LogTarget::MatrixSdkEventCache, LogLevel::Info),
+    (LogTarget::MatrixSdkEventCacheBackPagination, LogLevel::Info),
     (LogTarget::MatrixSdkLatestEvents, LogLevel::Info),
     (LogTarget::MatrixSdkBaseEventCache, LogLevel::Info),
     (LogTarget::MatrixSdkEventCacheStore, LogLevel::Info),
@@ -393,7 +405,8 @@ const DEFAULT_TARGET_LOG_LEVELS: &[(LogTarget, LogLevel)] = &[
     (LogTarget::MatrixSdkCommonDeserializedResponses, LogLevel::Warn),
     (LogTarget::MatrixSdkBaseStoreAmbiguityMap, LogLevel::Warn),
     (LogTarget::MatrixSdkUiNotificationClient, LogLevel::Info),
-    (LogTarget::MatrixSdkBaseResponseProcessors, LogLevel::Debug),
+    (LogTarget::MatrixSdkBaseResponseProcessors, LogLevel::Info),
+    (LogTarget::MatrixSdkSearch, LogLevel::Info),
 ];
 
 const IMMUTABLE_LOG_TARGETS: &[LogTarget] = &[
@@ -410,6 +423,8 @@ const IMMUTABLE_LOG_TARGETS: &[LogTarget] = &[
 pub enum TraceLogPacks {
     /// Enables all the logs relevant to the event cache.
     EventCache,
+    /// Enables all the logs relevant to the back-pagination queue.
+    BackPagination,
     /// Enables all the logs relevant to the send queue.
     SendQueue,
     /// Enables all the logs relevant to the timeline.
@@ -420,6 +435,8 @@ pub enum TraceLogPacks {
     SyncProfiling,
     /// Enables all the logs relevant to the latest events.
     LatestEvents,
+    /// Enables all the logs relevant to message search.
+    Search,
 }
 
 impl TraceLogPacks {
@@ -434,6 +451,7 @@ impl TraceLogPacks {
                 LogTarget::MatrixSdkCommonCrossProcessLock,
                 LogTarget::MatrixSdkCommonDeserializedResponses,
             ],
+            TraceLogPacks::BackPagination => &[LogTarget::MatrixSdkEventCacheBackPagination],
             TraceLogPacks::SendQueue => &[LogTarget::MatrixSdkSendQueue],
             TraceLogPacks::Timeline => {
                 &[LogTarget::MatrixSdkUiTimeline, LogTarget::MatrixSdkCommonDeserializedResponses]
@@ -452,6 +470,7 @@ impl TraceLogPacks {
                 LogTarget::MatrixSdkSendQueue,
                 LogTarget::MatrixSdkEventCache,
             ],
+            TraceLogPacks::Search => &[LogTarget::MatrixSdkSearch],
         }
     }
 }
@@ -515,7 +534,7 @@ impl TracingConfiguration {
         // Show full backtraces, if we run into panics.
         //
         // FIXME: Use safe API for this once stable. Tracking issue:
-        //        https://github.com/rust-lang/rust/issues/93346
+        // https://github.com/rust-lang/rust/issues/93346
         unsafe {
             std::env::set_var("RUST_BACKTRACE", "1");
         }
@@ -534,15 +553,13 @@ impl TracingConfiguration {
                     // Initialize the Sentry client with the given options.
                     let sentry_guard = sentry::init((
                         sentry_config.dsn,
-                        sentry::ClientOptions {
-                            traces_sampler: Some(Arc::new(|ctx| {
+                        sentry::ClientOptions::new()
+                            .traces_sampler(|ctx| {
                                 // Make sure bridge spans are always uploaded
                                 if ctx.name() == BRIDGE_SPAN_NAME { 1.0 } else { 0.0 }
-                            })),
-                            attach_stacktrace: true,
-                            release: Some(env!("VERGEN_GIT_SHA").into()),
-                            ..sentry::ClientOptions::default()
-                        },
+                            })
+                            .attach_stacktrace(true)
+                            .release(env!("VERGEN_GIT_SHA")),
                     ));
 
                     sentry::configure_scope(|scope| {
@@ -554,9 +571,10 @@ impl TracingConfiguration {
 
                     // Add a Sentry layer to the tracing subscriber.
                     //
-                    // Pass custom event and span filters, which will ignore anything, if the Sentry
-                    // support has been globally disabled, or if the statement doesn't include a
-                    // `sentry` field set to `true`.
+                    // Pass custom event and span filters, which will ignore
+                    // anything, if the Sentry support has been globally
+                    // disabled, or if the statement doesn't include a `sentry`
+                    // field set to `true`.
                     let sentry_layer = sentry_tracing::layer()
                         .event_filter({
                             let enabled = sentry_enabled.clone();
@@ -622,10 +640,10 @@ impl TracingConfiguration {
 }
 
 fn build_tracing_filter(config: &TracingConfiguration) -> String {
-    // We are intentionally not setting a global log level because we don't want to
-    // risk third party crates logging sensitive information.
-    // As such we need to make sure that panics will be properly logged.
-    // On 2025-01-08, `log_panics` uses the `panic` target, at the error log level.
+    // We are intentionally not setting a global log level because we don't want
+    // to risk third party crates logging sensitive information. As such we need
+    // to make sure that panics will be properly logged. On 2025-01-08,
+    // `log_panics` uses the `panic` target, at the error log level.
     let mut filters = vec!["panic=error".to_owned()];
 
     let global_level = config.log_level;
@@ -635,10 +653,12 @@ fn build_tracing_filter(config: &TracingConfiguration) -> String {
             // If the target is immutable, keep the log level.
             *default_level
         } else if config.trace_log_packs.iter().any(|pack| pack.targets().contains(target)) {
-            // If a log pack includes that target, set the associated log level to TRACE.
+            // If a log pack includes that target, set the associated log level
+            // to TRACE.
             LogLevel::Trace
         } else if *default_level > global_level {
-            // If the default level is more verbose than the global level, keep the default.
+            // If the default level is more verbose than the global level, keep
+            // the default.
             *default_level
         } else {
             // Otherwise, use the global level.
@@ -686,7 +706,7 @@ pub fn init_platform(
     }
 
     #[cfg(target_os = "android")]
-    android_platform::init();
+    android_platform::check_initialized();
 
     Ok(())
 }
@@ -703,7 +723,8 @@ pub fn enable_sentry_logging(enabled: bool) {
             warn!("Sentry logging is not enabled");
         }
     } else {
-        // Can't use log statements here, since logging hasn't been enabled yet 🧠
+        // Can't use log statements here, since logging hasn't been enabled yet
+        // 🧠
         eprintln!("Logging hasn't been enabled yet");
     };
 }
@@ -762,7 +783,8 @@ fn setup_lightweight_tokio_runtime() {
         let num_available_cores =
             std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
-        // The number of worker threads will be either that or 4, whichever is smaller.
+        // The number of worker threads will be either that or 4, whichever is
+        // smaller.
         let num_worker_threads = num_available_cores.min(4);
 
         // Chosen by a fair dice roll.
@@ -812,6 +834,7 @@ mod tests {
             matrix_sdk=info,
             matrix_sdk::client=trace,
             matrix_sdk_crypto=debug,
+            matrix_sdk_crypto::identities::manager=info,
             matrix_sdk_crypto::olm::account=trace,
             matrix_sdk::authentication::oauth=trace,
             matrix_sdk::http_client=debug,
@@ -820,6 +843,7 @@ mod tests {
             matrix_sdk_ui::timeline=info,
             matrix_sdk::send_queue=info,
             matrix_sdk::event_cache=info,
+            matrix_sdk::event_cache::back_pagination_queue=info,
             matrix_sdk::latest_events=info,
             matrix_sdk_base::event_cache=info,
             matrix_sdk_sqlite::event_cache_store=info,
@@ -827,7 +851,8 @@ mod tests {
             matrix_sdk_common::deserialized_responses=warn,
             matrix_sdk_base::store::ambiguity_map=warn,
             matrix_sdk_ui::notification_client=info,
-            matrix_sdk_base::response_processors=debug,
+            matrix_sdk_base::response_processors=info,
+            matrix_sdk_search=info,
             super_duper_app=error"#
                 .split('\n')
                 .map(|s| s.trim())
@@ -858,6 +883,7 @@ mod tests {
             matrix_sdk=info,
             matrix_sdk::client=trace,
             matrix_sdk_crypto=trace,
+            matrix_sdk_crypto::identities::manager=trace,
             matrix_sdk_crypto::olm::account=trace,
             matrix_sdk::authentication::oauth=trace,
             matrix_sdk::http_client=trace,
@@ -866,6 +892,7 @@ mod tests {
             matrix_sdk_ui::timeline=trace,
             matrix_sdk::send_queue=trace,
             matrix_sdk::event_cache=trace,
+            matrix_sdk::event_cache::back_pagination_queue=trace,
             matrix_sdk::latest_events=trace,
             matrix_sdk_base::event_cache=trace,
             matrix_sdk_sqlite::event_cache_store=trace,
@@ -874,6 +901,7 @@ mod tests {
             matrix_sdk_base::store::ambiguity_map=warn,
             matrix_sdk_ui::notification_client=trace,
             matrix_sdk_base::response_processors=trace,
+            matrix_sdk_search=trace,
             super_duper_app=trace,
             some_other_span=trace"#
                 .split('\n')
@@ -905,6 +933,7 @@ mod tests {
             matrix_sdk=info,
             matrix_sdk::client=trace,
             matrix_sdk_crypto=debug,
+            matrix_sdk_crypto::identities::manager=info,
             matrix_sdk_crypto::olm::account=trace,
             matrix_sdk::authentication::oauth=trace,
             matrix_sdk::http_client=debug,
@@ -913,6 +942,7 @@ mod tests {
             matrix_sdk_ui::timeline=info,
             matrix_sdk::send_queue=trace,
             matrix_sdk::event_cache=trace,
+            matrix_sdk::event_cache::back_pagination_queue=info,
             matrix_sdk::latest_events=info,
             matrix_sdk_base::event_cache=trace,
             matrix_sdk_sqlite::event_cache_store=trace,
@@ -920,12 +950,33 @@ mod tests {
             matrix_sdk_common::deserialized_responses=trace,
             matrix_sdk_base::store::ambiguity_map=warn,
             matrix_sdk_ui::notification_client=info,
-            matrix_sdk_base::response_processors=debug,
+            matrix_sdk_base::response_processors=info,
+            matrix_sdk_search=info,
             super_duper_app=info"#
                 .split('\n')
                 .map(|s| s.trim())
                 .collect::<Vec<_>>()
                 .join("")
         );
+    }
+
+    /// The `BackPagination` pack only bumps its own target, not the rest of the
+    /// `EventCache` pack.
+    #[test]
+    fn test_trace_log_pack_back_pagination_is_standalone() {
+        let config = super::TracingConfiguration {
+            log_level: super::LogLevel::Info,
+            trace_log_packs: vec![TraceLogPacks::BackPagination],
+            extra_targets: Vec::new(),
+            write_to_stdout_or_system: true,
+            write_to_files: None,
+            #[cfg(feature = "sentry")]
+            sentry_config: None,
+        };
+
+        let filter = build_tracing_filter(&config);
+
+        assert!(filter.contains("matrix_sdk::event_cache::back_pagination_queue=trace"));
+        assert!(filter.contains("matrix_sdk::event_cache=info"));
     }
 }

@@ -21,7 +21,7 @@ use ruma::{
 use serde_json::json;
 use url::Url;
 use wiremock::{
-    Mock, MockBuilder, ResponseTemplate,
+    Mock, MockBuilder,
     matchers::{method, path_regex},
 };
 
@@ -36,17 +36,17 @@ use super::{MatrixMock, MatrixMockServer, MockEndpoint};
 ///
 /// It works like this:
 ///
-/// * start by saying which endpoint you'd like to mock, e.g.
+/// - start by saying which endpoint you'd like to mock, e.g.
 ///   [`Self::mock_server_metadata()`]. This returns a specialized
 ///   [`MockEndpoint`] data structure, with its own impl. For this example, it's
 ///   `MockEndpoint<ServerMetadataEndpoint>`.
-/// * configure the response on the endpoint-specific mock data structure. For
+/// - configure the response on the endpoint-specific mock data structure. For
 ///   instance, if you want the sending to result in a transient failure, call
 ///   [`MockEndpoint::error500`]; if you want it to succeed and return the
 ///   metadata, call [`MockEndpoint::ok()`]. It's still possible to call
 ///   [`MockEndpoint::respond_with()`], as we do with wiremock MockBuilder, for
 ///   maximum flexibility when the helpers aren't sufficient.
-/// * once the endpoint's response is configured, for any mock builder, you get
+/// - once the endpoint's response is configured, for any mock builder, you get
 ///   a [`MatrixMock`]; this is a plain [`wiremock::Mock`] with the server
 ///   curried, so one doesn't have to pass it around when calling
 ///   [`MatrixMock::mount()`] or [`MatrixMock::mount_as_scoped()`]. As such, it
@@ -123,13 +123,20 @@ impl OAuthMockServer<'_> {
 }
 
 /// A prebuilt mock for a `GET /auth_metadata` request.
+#[derive(Default)]
 pub struct ServerMetadataEndpoint;
 
 impl<'a> MockEndpoint<'a, ServerMetadataEndpoint> {
+    /// Returns a successful response with the given metadata, honouring the
+    /// delay set with [`Self::with_delay`].
+    fn ok_with_metadata(self, metadata: Raw<AuthorizationServerMetadata>) -> MatrixMock<'a> {
+        self.ok_json(metadata)
+    }
+
     /// Returns a successful metadata response with all the supported endpoints.
     pub fn ok(self) -> MatrixMock<'a> {
         let metadata = MockServerMetadataBuilder::new(&self.server.uri()).build();
-        self.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        self.ok_with_metadata(metadata)
     }
 
     /// Returns a successful metadata response with all the supported endpoints
@@ -142,7 +149,7 @@ impl<'a> MockEndpoint<'a, ServerMetadataEndpoint> {
         let issuer = self.server.uri().replace("http://", "https://");
 
         let metadata = MockServerMetadataBuilder::new(&issuer).build();
-        self.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        self.ok_with_metadata(metadata)
     }
 
     /// Returns a successful metadata response without the device authorization
@@ -151,7 +158,7 @@ impl<'a> MockEndpoint<'a, ServerMetadataEndpoint> {
         let metadata = MockServerMetadataBuilder::new(&self.server.uri())
             .without_device_authorization()
             .build();
-        self.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        self.ok_with_metadata(metadata)
     }
 
     /// Returns a successful metadata response without the registration
@@ -159,7 +166,7 @@ impl<'a> MockEndpoint<'a, ServerMetadataEndpoint> {
     pub fn ok_without_registration(self) -> MatrixMock<'a> {
         let metadata =
             MockServerMetadataBuilder::new(&self.server.uri()).without_registration().build();
-        self.respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        self.ok_with_metadata(metadata)
     }
 }
 
@@ -269,10 +276,10 @@ pub struct RegistrationEndpoint;
 impl<'a> MockEndpoint<'a, RegistrationEndpoint> {
     /// Returns a successful registration response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        self.ok_json(json!({
             "client_id": "test_client_id",
             "client_id_issued_at": 1716375696,
-        })))
+        }))
     }
 }
 
@@ -288,14 +295,14 @@ impl<'a> MockEndpoint<'a, DeviceAuthorizationEndpoint> {
         let mut verification_uri_complete = issuer_url.join("link").unwrap();
         verification_uri_complete.set_query(Some("code=N32YVC"));
 
-        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        self.ok_json(json!({
             "device_code": "N8NAYD9fOhMulpm37mSthx0xSw2p7vdR",
             "expires_in": 1200,
             "interval": 5,
             "user_code": "N32YVC",
             "verification_uri": verification_uri,
             "verification_uri_complete": verification_uri_complete,
-        })))
+        }))
     }
 }
 
@@ -310,33 +317,42 @@ impl<'a> MockEndpoint<'a, TokenEndpoint> {
 
     /// Returns a successful token response with custom tokens.
     pub fn ok_with_tokens(self, access_token: &str, refresh_token: &str) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+        self.ok_json(json!({
             "access_token": access_token,
             "expires_in": 300,
             "refresh_token":  refresh_token,
             "token_type": "Bearer"
-        })))
+        }))
     }
 
     /// Returns an error response when the request was invalid.
     pub fn access_denied(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "access_denied",
-        })))
+        self.respond_with_code_and_json(
+            400,
+            json!({
+                "error": "access_denied",
+            }),
+        )
     }
 
     /// Returns an error response when the token in the request has expired.
     pub fn expired_token(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "expired_token",
-        })))
+        self.respond_with_code_and_json(
+            400,
+            json!({
+                "error": "expired_token",
+            }),
+        )
     }
 
     /// Returns an error response when the token in the request is invalid.
     pub fn invalid_grant(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "invalid_grant",
-        })))
+        self.respond_with_code_and_json(
+            400,
+            json!({
+                "error": "invalid_grant",
+            }),
+        )
     }
 }
 
@@ -346,6 +362,6 @@ pub struct RevocationEndpoint;
 impl<'a> MockEndpoint<'a, RevocationEndpoint> {
     /// Returns a successful revocation response.
     pub fn ok(self) -> MatrixMock<'a> {
-        self.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        self.ok_empty_json()
     }
 }

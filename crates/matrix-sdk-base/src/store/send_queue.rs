@@ -17,6 +17,8 @@
 use std::{collections::BTreeMap, fmt, ops::Deref};
 
 use as_variant::as_variant;
+#[cfg(feature = "unstable-msc4354")]
+use ruma::events::sticky::StickyDurationMs;
 use ruma::{
     MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedTransactionId, OwnedUserId,
     TransactionId, UInt,
@@ -88,6 +90,12 @@ pub enum QueuedRequestKind {
     Event {
         /// The content of the message-like event we'd like to send.
         content: SerializableEventContent,
+
+        /// How long the event should be sticky for, if it is to be sent as a
+        /// sticky event.
+        #[cfg(feature = "unstable-msc4354")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sticky_duration: Option<StickyDurationMs>,
     },
 
     /// Content to upload on the media server.
@@ -129,7 +137,11 @@ pub enum QueuedRequestKind {
 
 impl From<SerializableEventContent> for QueuedRequestKind {
     fn from(content: SerializableEventContent) -> Self {
-        Self::Event { content }
+        Self::Event {
+            content,
+            #[cfg(feature = "unstable-msc4354")]
+            sticky_duration: None,
+        }
     }
 }
 
@@ -161,7 +173,7 @@ pub struct QueuedRequest {
 impl QueuedRequest {
     /// Returns `Some` if the queued request is about sending an event.
     pub fn as_event(&self) -> Option<&SerializableEventContent> {
-        as_variant!(&self.kind, QueuedRequestKind::Event { content } => content)
+        as_variant!(&self.kind, QueuedRequestKind::Event { content, .. } => content)
     }
 
     /// True if the request couldn't be sent because of an unrecoverable API
@@ -174,10 +186,10 @@ impl QueuedRequest {
 /// Represents a failed to send unrecoverable error of an event sent via the
 /// send queue.
 ///
-/// It is a serializable representation of a client error, see
-/// `From` implementation for more details. These errors can not be
-/// automatically retried, but yet some manual action can be taken before retry
-/// sending. If not the only solution is to delete the local event.
+/// It is a serializable representation of a client error, see `From`
+/// implementation for more details. These errors can not be automatically
+/// retried, but yet some manual action can be taken before retry sending. If
+/// not the only solution is to delete the local event.
 #[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
 pub enum QueueWedgeError {
     /// This error occurs when there are some insecure devices in the room, and
@@ -200,6 +212,11 @@ pub enum QueueWedgeError {
     /// session before sending.
     #[error("Own verification is required")]
     CrossVerificationRequired,
+
+    /// The homeserver rejected the session's access token and the request can't
+    /// go out until the session has a working one again.
+    #[error("The access token was rejected")]
+    ExpiredAccessToken,
 
     /// Media content was cached in the media store, but has disappeared before
     /// we could upload it.
@@ -232,6 +249,15 @@ pub enum DependentQueuedRequestKind {
 
     /// The event should be redacted/aborted/removed.
     RedactEvent,
+
+    /// The event should be redacted/aborted/removed, with a reason applied to
+    /// the redaction if the event was sent by the time the abort was processed
+    /// and must be redacted server-side.
+    RedactEventWithReason {
+        /// Reason for the redaction, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 
     /// The event should be reacted to, with the given key.
     ReactEvent {
@@ -270,6 +296,11 @@ pub enum DependentQueuedRequestKind {
 
         /// Information about the thumbnail, if present.
         thumbnail_info: Option<FinishUploadThumbnailInfo>,
+
+        /// Additional top-level fields to merge into the final event content
+        /// before it is sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
     },
 
     /// Finish a gallery upload by updating references to the media cache and
@@ -283,6 +314,11 @@ pub enum DependentQueuedRequestKind {
 
         /// Metadata about the gallery items.
         item_infos: Vec<FinishGalleryItemInfo>,
+
+        /// Additional top-level fields to merge into the final event content
+        /// before it is sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<serde_json::Map<String, serde_json::Value>>,
     },
 }
 
@@ -306,9 +342,8 @@ pub struct FinishUploadThumbnailInfo {
     pub height: Option<UInt>,
 }
 
-/// Detailed record about a file and thumbnail. When finishing a gallery
-/// upload, one [`FinishGalleryItemInfo`] will be used for each media in the
-/// gallery.
+/// Detailed record about a file and thumbnail. When finishing a gallery upload,
+/// one [`FinishGalleryItemInfo`] will be used for each media in the gallery.
 #[cfg(feature = "unstable-msc4274")]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinishGalleryItemInfo {
@@ -316,6 +351,9 @@ pub struct FinishGalleryItemInfo {
     pub file_upload: OwnedTransactionId,
     /// Information about the thumbnail, if present.
     pub thumbnail_info: Option<FinishUploadThumbnailInfo>,
+    /// Additional fields to merge into this item's content before sending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A transaction id identifying a [`DependentQueuedRequest`] rather than its
@@ -490,16 +528,17 @@ pub struct DependentQueuedRequest {
 }
 
 impl DependentQueuedRequest {
-    /// Does the dependent request represent a new event that is *not*
+    /// Does the dependent request represent a new event that is _not_
     /// aggregated, aka it is going to be its own item in a timeline?
     pub fn is_own_event(&self) -> bool {
         match self.kind {
             DependentQueuedRequestKind::EditEvent { .. }
             | DependentQueuedRequestKind::RedactEvent
+            | DependentQueuedRequestKind::RedactEventWithReason { .. }
             | DependentQueuedRequestKind::ReactEvent { .. }
             | DependentQueuedRequestKind::UploadFileOrThumbnail { .. } => {
-                // These are all aggregated events, or non-visible items (file upload producing
-                // a new MXC ID).
+                // These are all aggregated events, or non-visible items (file
+                // upload producing a new MXC ID).
                 false
             }
             DependentQueuedRequestKind::FinishUpload { .. } => {
@@ -523,5 +562,66 @@ impl fmt::Debug for QueuedRequest {
             .field("transaction_id", &self.transaction_id)
             .field("is_wedged", &self.is_wedged())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use strass::assert_let;
+
+    use super::DependentQueuedRequestKind;
+
+    #[cfg(feature = "unstable-msc4274")]
+    #[test]
+    fn test_gallery_extra_content_storage_compatibility() {
+        let legacy = serde_json::json!({
+            "FinishGallery": {
+                "local_echo": { "msgtype": "dm.filament.gallery", "body": "gallery", "itemtypes": [] },
+                "item_infos": [{ "file_upload": "upload", "thumbnail_info": null }],
+            }
+        });
+        let kind: DependentQueuedRequestKind = serde_json::from_value(legacy.clone()).unwrap();
+        assert_let!(
+            DependentQueuedRequestKind::FinishGallery { item_infos, extra_content, .. } = &kind
+        );
+        assert!(extra_content.is_none());
+        assert!(item_infos[0].extra_content.is_none());
+        assert_eq!(serde_json::to_value(&kind).unwrap(), legacy);
+
+        let mut with_extra = legacy;
+        with_extra["FinishGallery"]["extra_content"] =
+            serde_json::json!({ "com.example.gallery": true });
+        with_extra["FinishGallery"]["item_infos"][0]["extra_content"] =
+            serde_json::json!({ "org.matrix.msc2448.is_spoiler": true });
+        let kind: DependentQueuedRequestKind = serde_json::from_value(with_extra.clone()).unwrap();
+        assert_eq!(serde_json::to_value(kind).unwrap(), with_extra);
+    }
+
+    #[test]
+    fn test_deserialize_legacy_redact_event() {
+        // `RedactEvent` is a unit variant, and must stay one for as long as it
+        // exists: requests persisted before `RedactEventWithReason` are
+        // serialized as a plain string, and this is the only thing that still
+        // reads them.
+        let deserialized: DependentQueuedRequestKind =
+            serde_json::from_str("\"RedactEvent\"").unwrap();
+        assert_matches!(deserialized, DependentQueuedRequestKind::RedactEvent);
+    }
+
+    #[test]
+    fn test_redact_event_with_reason_round_trip() {
+        for reason in [None, Some("spam".to_owned())] {
+            let kind = DependentQueuedRequestKind::RedactEventWithReason { reason: reason.clone() };
+            let serialized = serde_json::to_string(&kind).unwrap();
+            let deserialized: DependentQueuedRequestKind =
+                serde_json::from_str(&serialized).unwrap();
+            assert_let!(
+                DependentQueuedRequestKind::RedactEventWithReason { reason: deserialized } =
+                    deserialized
+            );
+            assert_eq!(deserialized, reason);
+        }
     }
 }

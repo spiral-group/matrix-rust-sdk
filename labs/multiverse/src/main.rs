@@ -1,9 +1,11 @@
 #![allow(clippy::large_enum_variant)]
+#![recursion_limit = "256"]
 
 use std::{
     collections::{HashMap, HashSet},
     io::{self, Write, stdout},
     path::{Path, PathBuf},
+    pin::pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -16,7 +18,7 @@ use crossterm::{
     },
     execute,
 };
-use futures_util::{StreamExt as _, pin_mut};
+use futures_util::StreamExt as _;
 use imbl::Vector;
 use layout::Flex;
 use matrix_sdk::{
@@ -85,7 +87,7 @@ struct Cli {
     #[clap(short, long, env = "PROXY")]
     proxy: Option<Url>,
 
-    /// Whether to *not* reload the `pos`ition sliding sync token from disk at
+    /// Whether to _not_ reload the `pos`ition sliding sync token from disk at
     /// start or not, for the room list sliding sync.
     ///
     /// Set to false by default (i.e. reload the position from disk).
@@ -148,10 +150,6 @@ async fn main() -> Result<()> {
             }
         }
     });
-
-    let event_cache = client.event_cache();
-    event_cache.config_mut().experimental_auto_backpagination = true;
-    event_cache.subscribe()?;
 
     let terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -231,8 +229,8 @@ impl App {
             all_rooms,
         ));
 
-        // This will sync (with encryption) until an error happens or the program is
-        // stopped.
+        // This will sync (with encryption) until an error happens or the
+        // program is stopped.
         sync_service.start().await;
 
         let status = Status::new();
@@ -274,7 +272,7 @@ impl App {
         let (stream, entries_controller) = all_rooms.entries_with_dynamic_adapters(50_000);
         entries_controller.set_filter(Box::new(new_filter_non_left()));
 
-        pin_mut!(stream);
+        let mut stream = pin!(stream);
 
         let mut previous_rooms = HashSet::new();
 
@@ -331,10 +329,11 @@ impl App {
                 let (items, stream) = timeline.subscribe().await;
                 let items = Arc::new(Mutex::new(items));
 
-                // Spawn a timeline task that will listen to all the timeline item changes.
+                // Spawn a timeline task that will listen to all the timeline
+                // item changes.
                 let i = items.clone();
                 let timeline_task = spawn(async move {
-                    pin_mut!(stream);
+                    let mut stream = pin!(stream);
                     let items = i;
                     while let Some(diffs) = stream.next().await {
                         let mut items = items.lock();
@@ -395,7 +394,7 @@ impl App {
         for room in client.rooms_filtered(RoomStateFilter::JOINED.union(RoomStateFilter::LEFT)) {
             let room_id = room.room_id();
 
-            let maybe_room_cache = room.event_cache().await;
+            let maybe_room_cache = client.event_cache().unwrap().room(room_id).await;
             let Ok((room_cache, _drop_handles)) = maybe_room_cache else {
                 warn!("Failed to get RoomEventCache: {maybe_room_cache:?}");
                 continue;
@@ -451,10 +450,9 @@ impl App {
 
         while !rooms.is_empty() {
             let room = &rooms[idx];
-
             let room_id = room.room_id();
 
-            let maybe_room_cache = room.event_cache().await;
+            let maybe_room_cache = client.event_cache().unwrap().room(room_id).await;
             let Ok((room_cache, _drop_handles)) = maybe_room_cache else {
                 warn!("Failed to get RoomEventCache: {maybe_room_cache:?}");
                 idx = (idx + 1) % rooms.len();
@@ -745,7 +743,7 @@ impl App {
                                         if *is_global {
                                             let search =
                                                 self.client.search_messages(query).build_events();
-                                            pin_mut!(search);
+                                            let mut search = pin!(search);
 
                                             let mut all_results = HashMap::new();
                                             while let Some(result) = search.next().await {
@@ -772,7 +770,7 @@ impl App {
                                             view.get_text().zip(self.room_view.room())
                                         {
                                             let room_search = room.search_messages_events(query);
-                                            pin_mut!(room_search);
+                                            let mut room_search = pin!(room_search);
 
                                             let mut all_results = Vec::new();
                                             while let Some(result) = room_search.next().await {
@@ -832,7 +830,8 @@ impl App {
     async fn run(&mut self, terminal: DefaultTerminal) -> Result<()> {
         self.render_loop(terminal).await?;
 
-        // At this point the user has exited the loop, so shut down the application.
+        // At this point the user has exited the loop, so shut down the
+        // application.
         ratatui::restore();
         execute!(stdout(), DisableMouseCapture)?;
 
@@ -848,8 +847,8 @@ impl Widget for &mut App {
             Layout::vertical([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)]);
         let [header_area, rest_area, status_area] = vertical.areas(area);
 
-        // Create two chunks with equal horizontal screen space. One for the list and
-        // the other for the info block.
+        // Create two chunks with equal horizontal screen space. One for the
+        // list and the other for the info block.
         let horizontal =
             Layout::horizontal([Constraint::Percentage(25), Constraint::Percentage(75)]);
         let [room_list_area, room_view_area] = horizontal.areas(rest_area);
@@ -918,6 +917,7 @@ async fn configure_client(cli: Cli) -> Result<Client> {
             auto_enable_backups: true,
         })
         .with_enable_share_history_on_invite(true)
+        .with_enable_automatic_back_pagination(true)
         .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: true })
         .search_index_store(SearchIndexStoreKind::UnencryptedDirectory(
             session_path.join("indexData"),

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use matrix_sdk::test_utils::mocks::MatrixMockServer;
 use matrix_sdk_test::{JoinedRoomBuilder, event_factory::EventFactory};
@@ -47,8 +49,7 @@ pub fn create_timeline_with_initial_events(c: &mut Criterion) {
                 .expect("missing event ID");
             events.push(f.reaction(&prev_event_id, "👍").sender(sender).into_raw_sync());
         } else if j == 8 {
-            // Edit.
-            // Note: (i-3)%3 is the same as i%3 -> same sender!
+            // Edit. Note: (i-3)%3 is the same as i%3 -> same sender!
             let prev_event_id = events[i - 3]
                 .get_field::<OwnedEventId>("event_id")
                 .expect("invalid event ID")
@@ -66,8 +67,7 @@ pub fn create_timeline_with_initial_events(c: &mut Criterion) {
                     .into_raw_sync(),
             );
         } else if j == 9 {
-            // Redaction.
-            // Note: (i-6)%3 is the same as i%6 -> same sender!
+            // Redaction. Note: (i-6)%3 is the same as i%6 -> same sender!
             let prev_event_id = events[i - 6]
                 .get_field::<OwnedEventId>("event_id")
                 .expect("invalid event ID")
@@ -83,8 +83,6 @@ pub fn create_timeline_with_initial_events(c: &mut Criterion) {
     let room = runtime.block_on(async move {
         let server = MatrixMockServer::new().await;
         let client = server.client_builder().build().await;
-
-        client.event_cache().subscribe().unwrap();
 
         let room = server.sync_room(&client, builder).await;
         drop(server);

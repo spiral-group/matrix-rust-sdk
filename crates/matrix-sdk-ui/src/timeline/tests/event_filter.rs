@@ -15,13 +15,12 @@
 use std::sync::Arc;
 
 use assert_matches::assert_matches;
-use assert_matches2::assert_let;
 use eyeball_im::VectorDiff;
 use matrix_sdk::deserialized_responses::TimelineEvent;
-use matrix_sdk_test::{ALICE, BOB, async_test, sync_timeline_event};
+use matrix_sdk_test::{User, async_test, sync_timeline_event};
 use ruma::{
     events::{
-        AnySyncTimelineEvent, TimelineEventType,
+        AnySyncTimelineEvent, MessageLikeEventType, StateEventType, TimelineEventType,
         room::{
             member::MembershipState,
             message::{MessageType, RedactedRoomMessageEventContent},
@@ -29,6 +28,7 @@ use ruma::{
     },
     mxc_uri,
 };
+use strass::assert_let;
 use stream_assert::assert_next_matches;
 
 use super::TestTimeline;
@@ -46,7 +46,7 @@ async fn test_default_filter() {
     let f = &timeline.factory;
 
     // Test edits work.
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
 
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
@@ -55,7 +55,7 @@ async fn test_default_filter() {
     timeline
         .handle_live_event(
             f.text_msg(" * The _edited_ first message")
-                .sender(&ALICE)
+                .sender(User::Alice)
                 .edit(first_event_id, MessageType::text_plain("The _edited_ first message").into()),
         )
         .await;
@@ -69,28 +69,25 @@ async fn test_default_filter() {
     // TODO: After adding raw timeline items, check for one here.
 
     // Test redactions work.
-    timeline.handle_live_event(f.text_msg("The second message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The second message").sender(User::Alice)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let second_event_id = item.as_event().unwrap().event_id().unwrap();
 
-    timeline.handle_live_event(f.redaction(second_event_id).sender(&BOB)).await;
+    timeline.handle_live_event(f.redaction(second_event_id).sender(User::Bob)).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 2, value } => value);
     assert!(item.as_event().unwrap().content().is_redacted());
 
     // TODO: After adding raw timeline items, check for one here.
 
     // Test reactions work.
-    timeline.handle_live_event(f.text_msg("The third message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The third message").sender(User::Alice)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let third_event_id = item.as_event().unwrap().event_id().unwrap();
 
-    timeline.handle_live_event(f.reaction(third_event_id, "+1").sender(&BOB)).await;
-    timeline.handle_live_event(f.redaction(second_event_id).sender(&BOB)).await;
+    timeline.handle_live_event(f.reaction(third_event_id, "+1").sender(User::Bob)).await;
+    timeline.handle_live_event(f.redaction(second_event_id).sender(User::Bob)).await;
     let item = assert_next_matches!(stream, VectorDiff::Set { index: 3, value } => value);
-    assert_eq!(
-        item.as_event().unwrap().content().reactions().cloned().unwrap_or_default().len(),
-        1
-    );
+    assert_eq!(item.as_event().unwrap().reactions().len(), 1);
 
     // TODO: After adding raw timeline items, check for one here.
 
@@ -105,13 +102,15 @@ async fn test_filter_always_false() {
         .await;
 
     let f = &timeline.factory;
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
 
-    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
+    timeline
+        .handle_live_event(f.redacted(User::Alice, RedactedRoomMessageEventContent::new()))
+        .await;
 
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
 
-    timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("Alice's room").sender(User::Alice)).await;
 
     assert_eq!(timeline.controller.items().await.len(), 0);
 }
@@ -129,16 +128,18 @@ async fn test_custom_filter() {
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let _date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
-    timeline.handle_live_event(f.redacted(&ALICE, RedactedRoomMessageEventContent::new())).await;
+    timeline
+        .handle_live_event(f.redacted(User::Alice, RedactedRoomMessageEventContent::new()))
+        .await;
     let _item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
 
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
 
-    timeline.handle_live_event(f.room_name("Alice's room").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("Alice's room").sender(User::Alice)).await;
 
     assert_eq!(timeline.controller.items().await.len(), 3);
 }
@@ -156,7 +157,7 @@ async fn test_custom_filter_for_custom_msglike_event() {
     let mut stream = timeline.subscribe().await;
 
     let f = &timeline.factory;
-    timeline.handle_live_event(f.custom_message_like_event().sender(&ALICE)).await;
+    timeline.handle_live_event(f.custom_message_like_event().sender(User::Alice)).await;
     let item = assert_next_matches!(stream, VectorDiff::PushBack { value } => value);
     let date_divider = assert_next_matches!(stream, VectorDiff::PushFront { value } => value);
 
@@ -221,12 +222,12 @@ async fn test_event_filter_include_only_room_names() {
     let f = &timeline.factory;
 
     // Add a non-encrypted message event
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
     // Add a couple of room name events
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name (again)").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(User::Alice)).await;
     // And a different state event
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
 
     // The timeline should contain only the room name events
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
@@ -256,12 +257,12 @@ async fn test_event_filter_exclude_messages() {
     let f = &timeline.factory;
 
     // Add a message event
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
     // Add a couple of room name state events
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name (again)").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(User::Alice)).await;
     // And a different state event
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
 
     // The timeline should contain everything except for the message event.
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
@@ -292,26 +293,26 @@ async fn test_event_filter_include_only_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -345,26 +346,26 @@ async fn test_event_filter_include_only_profile_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -401,26 +402,26 @@ async fn test_event_filter_include_only_messages_and_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -457,30 +458,31 @@ async fn test_event_filter_exclude_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
-    // The timeline should contain everything except for the invite and join events
+    // The timeline should contain everything except for the invite and join
+    // events
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
     let num_text_message_items = event_items.iter().filter(is_text_message_item).count();
     let num_room_name_items = event_items.iter().filter(is_room_name_item).count();
@@ -510,31 +512,31 @@ async fn test_event_filter_exclude_profile_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
-    // The timeline should contain everything except for the display name and avatar
-    // URL changes
+    // The timeline should contain everything except for the display name and
+    // avatar URL changes
     let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
     let num_text_message_items = event_items.iter().filter(is_text_message_item).count();
     let num_room_name_items = event_items.iter().filter(is_room_name_item).count();
@@ -567,26 +569,26 @@ async fn test_event_filter_exclude_messages_and_membership_changes() {
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob joins
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
-    timeline.handle_live_event(f.member(&BOB).previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
+    timeline.handle_live_event(f.member(User::Bob).previous(MembershipState::Invite)).await;
     // Bob changes his display name
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
 
@@ -623,27 +625,27 @@ async fn test_event_filter_can_exclude_only_join_and_leave_membership_changes() 
     let f = &timeline.factory;
 
     // Add Alice's join event
-    timeline.handle_live_event(f.member(&ALICE).membership(MembershipState::Join)).await;
+    timeline.handle_live_event(f.member(User::Alice).membership(MembershipState::Join)).await;
     // Alice changes her avatar
     timeline
         .handle_live_event(
-            f.member(&ALICE)
+            f.member(User::Alice)
                 .avatar_url(mxc_uri!("mxc://example.org/SEsfnsuifSDFSSEF"))
                 .previous(MembershipState::Join),
         )
         .await;
     // Alice sends a message and changes the room name and topic
-    timeline.handle_live_event(f.text_msg("The first message").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_name("A new room name").sender(&ALICE)).await;
-    timeline.handle_live_event(f.room_topic("A new room topic").sender(&ALICE)).await;
+    timeline.handle_live_event(f.text_msg("The first message").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
     // Alice invites Bob and Bob changes his display name and leaves
-    timeline.handle_live_event(f.member(&ALICE).invited(&BOB)).await;
+    timeline.handle_live_event(f.member(User::Alice).invited(User::Bob)).await;
     timeline
         .handle_live_event(
-            f.member(&BOB).display_name("Big Bob 99").previous(MembershipState::Join),
+            f.member(User::Bob).display_name("Big Bob 99").previous(MembershipState::Join),
         )
         .await;
-    timeline.handle_live_event(f.member(&BOB).leave().previous(MembershipState::Invite)).await;
+    timeline.handle_live_event(f.member(User::Bob).leave().previous(MembershipState::Invite)).await;
 
     // The timeline should contain everything except for the message, invite and
     // join events
@@ -653,14 +655,87 @@ async fn test_event_filter_can_exclude_only_join_and_leave_membership_changes() 
     let num_room_topic_items = event_items.iter().filter(is_room_topic_item).count();
     let num_membership_change_items = event_items.iter().filter(is_membership_change_item).count();
     let num_profile_change_items = event_items.iter().filter(is_profile_change_item).count();
-    // 2 profile changes + 1 text message + 1 room name + 1 room topic + 1 invited
-    // membership change
+    // 2 profile changes + 1 text message + 1 room name + 1 room topic + 1
+    // invited membership change
     assert_eq!(event_items.len(), 6);
     assert_eq!(num_text_message_items, 1);
     assert_eq!(num_room_name_items, 1);
     assert_eq!(num_room_topic_items, 1);
     assert_eq!(num_membership_change_items, 1);
     assert_eq!(num_profile_change_items, 2);
+}
+
+#[async_test]
+async fn test_event_filter_exclude_any_custom_message_like_event_type() {
+    // Don't return any custom message-like events
+    let event_filter =
+        TimelineEventFilter::Exclude(vec![TimelineEventCondition::AnyCustomMessageLikeEvent]);
+
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+            ..Default::default()
+        })
+        .build()
+        .await;
+    let f = &timeline.factory;
+
+    // Add a normal message event that will be kept
+    timeline.handle_live_event(f.text_msg("Hey").sender(User::Alice)).await;
+    // And a custom message event that will be filtered out
+    timeline.handle_live_event(f.custom_message_like_event().sender(User::Alice)).await;
+    // Add a couple of room name state events
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(User::Alice)).await;
+    // And a different state event
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
+
+    // The timeline should contain everything except for the message event.
+    let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
+    let num_normal_text_message_items = event_items.iter().filter(is_text_message_item).count();
+    let num_custom_text_message_items =
+        event_items.iter().filter(is_custom_text_message_item).count();
+    let num_room_name_items = event_items.iter().filter(is_room_name_item).count();
+    let num_room_topic_items = event_items.iter().filter(is_room_topic_item).count();
+    assert_eq!(event_items.len(), 4);
+    assert_eq!(num_normal_text_message_items, 1);
+    assert_eq!(num_custom_text_message_items, 0);
+    assert_eq!(num_room_name_items, 2);
+    assert_eq!(num_room_topic_items, 1);
+}
+
+#[async_test]
+async fn test_event_filter_exclude_any_custom_state_event_type() {
+    // Don't return any custom state events
+    let event_filter =
+        TimelineEventFilter::Exclude(vec![TimelineEventCondition::AnyCustomStateEvent]);
+
+    let timeline = TestTimelineBuilder::new()
+        .settings(TimelineSettings {
+            event_filter: Arc::new(move |event, _| event_filter.filter(event)),
+            ..Default::default()
+        })
+        .build()
+        .await;
+    let f = &timeline.factory;
+
+    // Add customs state event that will be filtered out
+    timeline.handle_live_event(f.custom_state_event().sender(User::Alice)).await;
+    // Add a couple of room name state events
+    timeline.handle_live_event(f.room_name("A new room name").sender(User::Alice)).await;
+    timeline.handle_live_event(f.room_name("A new room name (again)").sender(User::Alice)).await;
+    // And a different state event
+    timeline.handle_live_event(f.room_topic("A new room topic").sender(User::Alice)).await;
+
+    // The timeline should contain everything except for the message event.
+    let event_items: Vec<Arc<TimelineItem>> = timeline.get_event_items().await;
+    let num_custom_state_items = event_items.iter().filter(is_custom_state_item).count();
+    let num_room_name_items = event_items.iter().filter(is_room_name_item).count();
+    let num_room_topic_items = event_items.iter().filter(is_room_topic_item).count();
+    assert_eq!(event_items.len(), 3);
+    assert_eq!(num_custom_state_items, 0);
+    assert_eq!(num_room_name_items, 2);
+    assert_eq!(num_room_topic_items, 1);
 }
 
 impl TestTimeline {
@@ -687,6 +762,27 @@ fn is_text_message_item(item: &&Arc<TimelineItem>) -> bool {
         },
         _ => false,
     }
+}
+
+fn is_custom_text_message_item(item: &&Arc<TimelineItem>) -> bool {
+    let msg_like = item.as_event().and_then(|e| e.content.as_msglike()).map(|e| e.kind.clone());
+    match msg_like {
+        Some(MsgLikeKind::Other(other)) => {
+            matches!(other.event_type, MessageLikeEventType::_Custom(_))
+        }
+        _ => false,
+    }
+}
+
+fn is_custom_state_item(item: &&Arc<TimelineItem>) -> bool {
+    let event_type = item
+        .as_event()
+        .and_then(|e| match e.content() {
+            TimelineItemContent::OtherState(state) => Some(state.content()),
+            _ => None,
+        })
+        .map(|e| e.event_type());
+    matches!(event_type, Some(StateEventType::_Custom(_)))
 }
 
 fn is_room_name_item(item: &&Arc<TimelineItem>) -> bool {

@@ -9,6 +9,8 @@ following MSC's:
 - [MSC2762: Allowing widgets to send/receive events](https://github.com/matrix-org/matrix-spec-proposals/blob/travis/msc/widgets-send-receive-events/proposals/2762-widget-event-receiving.md)
 - [MSC4157: Delayed Events (widget api)](https://github.com/matrix-org/matrix-spec-proposals/pull/4157)
 - [MSC3819: Allowing widgets to send/receive to-device messages](https://github.com/matrix-org/matrix-spec-proposals/pull/3819)
+- [MSC4515: RTC transports discovery (widget api)](https://github.com/matrix-org/matrix-spec-proposals/pull/4515)
+- [MSC4533: LiveKit client-server endpoints (widget api)](https://github.com/matrix-org/matrix-spec-proposals/pull/4533)
 
 It supports sending and reading events and provides some rudimentary client
 navigation features. There are some additional actions:
@@ -16,6 +18,9 @@ navigation features. There are some additional actions:
 - Get an OpenID token (not OAuth) to identify a user.
 - Ask for supported API versions.
 - Inform the client that the widget has loaded its content and is ready.
+- Discover the RTC transports advertised by the homeserver.
+- Obtain a token to authenticate with a LiveKit SFU from the homeserver.
+- Hand the delayed leave event of a MatrixRTC session over to the homeserver.
 
 ## The widget api
 
@@ -204,6 +209,7 @@ To use this module, two structs are needed:
 ```rust
 # async {
 use matrix_sdk::widget::{Capabilities, CapabilitiesProvider, WidgetSettings, WidgetDriver};
+use std::sync::Arc;
 use tokio::spawn;
 use url::Url;
 
@@ -231,6 +237,7 @@ let widget_settings = WidgetSettings::new(
 
 // Create the required structs:
 let (driver, handle) = WidgetDriver::new(widget_settings);
+let handle = Arc::new(handle);
 let cap_provider = CapProv {};
 
 mod my_platform {
@@ -245,7 +252,7 @@ spawn({
     async move {
         loop {
             let message = my_platform::receive_post_message().await;
-            h.send(message).await;
+            h.send(message);
         }
     }
 });
