@@ -1,5 +1,5 @@
 // Modified by the Spiral authors, 2026: the matrixrtc, spiral_agents,
-// spiral_apps and spiral_presence modules.
+// spiral_apps, spiral_presence and spiral_profile modules.
 
 #![recursion_limit = "256"]
 #![allow(unused_qualifications, clippy::new_without_default)]
@@ -44,6 +44,7 @@ mod spaces;
 mod spiral_agents;
 mod spiral_apps;
 mod spiral_presence;
+mod spiral_profile;
 mod store;
 mod sync_service;
 mod sync_v2;
