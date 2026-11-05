@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified by the Spiral authors, 2026: exports RtcCallOutcome.
+// Modified by the Spiral authors, 2026: exports RtcCallOutcome, and says which
+// events add an implicit read receipt.
 
 //! A high-level view into a room's contents.
 //!
@@ -900,7 +901,9 @@ impl Timeline {
     ///
     /// Contrary to [`Room::load_user_receipt()`] that only keeps track of read
     /// receipts received from the homeserver, this keeps also track of implicit
-    /// read receipts in this timeline, i.e. when a room member sends an event.
+    /// read receipts in this timeline, i.e. when a room member sends an event
+    /// that can hold a read receipt under the [`TimelineReadReceiptTracking`]
+    /// in use, or when our own user sends any event.
     #[instrument(skip(self))]
     pub async fn latest_user_read_receipt(
         &self,
@@ -1344,6 +1347,9 @@ pub enum TimelineReadReceiptTracking {
     /// Track read receipts for all events.
     AllEvents,
     /// Track read receipts only for message-like events.
+    ///
+    /// A state event from another user isn't a read: it adds no implicit read
+    /// receipt.
     MessageLikeEvents,
     /// Disable read receipt tracking.
     Disabled,

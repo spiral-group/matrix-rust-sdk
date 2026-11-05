@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: an event that can't hold a read receipt
+// adds no implicit one for another user, a malformed state event included.
+
 use std::collections::{HashMap, HashSet};
 
 use eyeball_im::VectorDiff;
@@ -624,20 +627,13 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         }
     }
 
-    /// Whether this event can show read receipts, or if they should be moved to
-    /// the previous event.
-    fn can_show_read_receipts(
-        &self,
-        settings: &TimelineSettings,
-        event: &AnySyncTimelineEvent,
-    ) -> bool {
-        match event {
-            AnySyncTimelineEvent::State(_) => {
-                matches!(settings.track_read_receipts, TimelineReadReceiptTracking::AllEvents)
-            }
-            AnySyncTimelineEvent::MessageLike(_) => {
-                !matches!(settings.track_read_receipts, TimelineReadReceiptTracking::Disabled)
-            }
+    /// Whether an event of this kind can show read receipts, or if they should
+    /// be moved to the previous event.
+    fn can_show_read_receipts(settings: &TimelineSettings, is_state_event: bool) -> bool {
+        match settings.track_read_receipts {
+            TimelineReadReceiptTracking::AllEvents => true,
+            TimelineReadReceiptTracking::MessageLikeEvents => !is_state_event,
+            TimelineReadReceiptTracking::Disabled => false,
         }
     }
 
@@ -662,6 +658,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         bool,
     )> {
         let state_key: Option<String> = raw.get_field("state_key").ok().flatten();
+        let can_show_read_receipts = Self::can_show_read_receipts(settings, state_key.is_some());
 
         // A state event is an event that has a state key. Note that the two
         // branches differ because the inferred return type for `get_field` is
@@ -720,7 +717,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                     vec![TimelineAction::failed_to_parse(event_type, deserialization_error)],
                     None,
                     true,
-                    true,
+                    can_show_read_receipts,
                 ))
             }
 
@@ -737,7 +734,13 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                 // Remember the event before returning prematurely. See
                 // [`ObservableItems::all_remote_events`].
                 self.add_or_update_remote_event(
-                    EventMeta::new(event_id, sender.as_deref(), false, false, None),
+                    EventMeta::new(
+                        event_id,
+                        sender.as_deref(),
+                        false,
+                        can_show_read_receipts,
+                        None,
+                    ),
                     sender.as_deref(),
                     origin_server_ts,
                     position,
@@ -886,7 +889,10 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
                     position,
                 );
 
-                let can_show_read_receipts = self.can_show_read_receipts(settings, &event);
+                let can_show_read_receipts = Self::can_show_read_receipts(
+                    settings,
+                    matches!(event, AnySyncTimelineEvent::State(_)),
+                );
 
                 (
                     event.event_id().to_owned(),
@@ -1140,6 +1146,7 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         settings: &TimelineSettings,
     ) {
         let event_id = event_meta.event_id.clone();
+        let can_show_read_receipts = event_meta.can_show_read_receipts;
 
         match position {
             TimelineItemPosition::Start { .. } => self.items.push_front_remote_event(event_meta),
@@ -1181,7 +1188,12 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
         {
             self.load_read_receipts_for_event(&event_id, room_data_provider).await;
 
-            self.maybe_add_implicit_read_receipt(&event_id, sender, timestamp);
+            self.maybe_add_implicit_read_receipt(
+                &event_id,
+                sender,
+                timestamp,
+                can_show_read_receipts,
+            );
         }
     }
 

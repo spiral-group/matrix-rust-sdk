@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a state event from another user adds no
+// implicit read receipt when only message-like events hold them.
+
 use std::ops::Not as _;
 
 use assert_matches::assert_matches;
@@ -25,9 +28,9 @@ use matrix_sdk::{
 use matrix_sdk_test::{
     ALICE, BOB, CAROL, JoinedRoomBuilder, User, async_test, event_factory::EventFactory,
 };
-use matrix_sdk_ui::timeline::{RoomExt, TimelineFocus, TimelineReadReceiptTracking};
+use matrix_sdk_ui::timeline::{RoomExt, Timeline, TimelineFocus, TimelineReadReceiptTracking};
 use ruma::{
-    MilliSecondsSinceUnixEpoch, OwnedEventId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId,
     api::client::receipt::create_receipt::v3::ReceiptType as CreateReceiptType,
     event_id,
     events::{
@@ -38,8 +41,9 @@ use ruma::{
             SyncRoomMessageEvent,
         },
     },
-    owned_event_id, room_id,
+    mxc_uri, owned_event_id, room_id,
     room_version_rules::RoomVersionRules,
+    serde::Raw,
     uint, user_id,
 };
 use serde_json::json;
@@ -474,7 +478,7 @@ async fn test_read_receipts_updates_on_message_like_events() {
         .await;
 
     assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
-    assert_eq!(timeline_updates.len(), 5);
+    assert_eq!(timeline_updates.len(), 4);
 
     // We don't list the read receipt of our own user on events.
     assert_let!(VectorDiff::PushBack { value: item_a } = &timeline_updates[0]);
@@ -487,26 +491,20 @@ async fn test_read_receipts_updates_on_message_like_events() {
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
     assert_eq!(own_receipt_timeline_event, event_a_id);
 
-    // Implicit read receipt of @bob:localhost.
-    assert_let!(VectorDiff::Set { index: 0, value: item_a } = &timeline_updates[1]);
-    let event_a = item_a.as_event().unwrap();
-    assert_eq!(event_a.read_receipts().len(), 1);
-
-    assert_let!(VectorDiff::PushBack { value: item_b } = &timeline_updates[2]);
+    // Event B is a state event from @bob:localhost: it can't hold a read
+    // receipt, so it adds no implicit one and event A stays unread by him.
+    assert_let!(VectorDiff::PushBack { value: item_b } = &timeline_updates[1]);
     let event_b = item_b.as_event().unwrap();
     assert_eq!(event_b.read_receipts().len(), 0);
 
-    // Real receipt is on event B.
-    let (bob_receipt_event_id, _) =
-        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
-    assert_eq!(bob_receipt_event_id, event_b_id);
-    // Visible receipt is on event A.
+    let bob_receipt = timeline.latest_user_read_receipt(User::Bob.into()).await;
+    assert_matches!(bob_receipt, None);
     let bob_receipt_timeline_event =
-        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
-    assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await;
+    assert_matches!(bob_receipt_timeline_event, None);
 
     // Implicit read receipt of @alice:localhost.
-    assert_let!(VectorDiff::PushBack { value: item_c } = &timeline_updates[3]);
+    assert_let!(VectorDiff::PushBack { value: item_c } = &timeline_updates[2]);
     let event_c = item_c.as_event().unwrap();
     assert_eq!(event_c.read_receipts().len(), 1);
 
@@ -517,7 +515,7 @@ async fn test_read_receipts_updates_on_message_like_events() {
         timeline.latest_user_read_receipt_timeline_event_id(User::Alice.into()).await.unwrap();
     assert_eq!(alice_receipt_timeline_event, event_c_id);
 
-    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[4]);
+    assert_let!(VectorDiff::PushFront { value: date_divider } = &timeline_updates[3]);
     assert!(date_divider.is_date_divider());
 
     // Read receipt on filtered event.
@@ -539,6 +537,34 @@ async fn test_read_receipts_updates_on_message_like_events() {
     let own_receipt_timeline_event =
         timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
     assert_eq!(own_receipt_timeline_event, event_a.event_id().unwrap());
+
+    // A real receipt on the state event still counts: Bob did read that far.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_receipt(
+                f.read_receipts()
+                    .add(event_b_id, *BOB, EventReceiptType::Read, ReceiptThread::Unthreaded)
+                    .into_event(),
+            ),
+        )
+        .await;
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+
+    assert_let!(VectorDiff::Set { index: 1, value: item_a } = &timeline_updates[0]);
+    let event_a = item_a.as_event().unwrap();
+    assert_eq!(event_a.read_receipts().len(), 1);
+
+    // Real receipt is on event B.
+    let (bob_receipt_event_id, _) =
+        timeline.latest_user_read_receipt(User::Bob.into()).await.unwrap();
+    assert_eq!(bob_receipt_event_id, event_b_id);
+    // Visible receipt is on event A.
+    let bob_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(User::Bob.into()).await.unwrap();
+    assert_eq!(bob_receipt_timeline_event, event_a.event_id().unwrap());
 
     // Update with explicit read receipt.
     server
@@ -2178,4 +2204,260 @@ async fn test_no_duplicate_receipt_after_backpagination_with_message_like_events
     // Carol's receipt must be on $3 (the message after the state event), and
     // nowhere else.
     assert_eq!(seen_users.get(User::Carol.as_str()).map(|id| id.as_ref()), Some(eid3));
+}
+
+/// The users who hold a read receipt on the timeline item of the given event.
+async fn receipts_shown_on(timeline: &Timeline, event_id: &EventId) -> Vec<OwnedUserId> {
+    let item = timeline.item_by_event_id(event_id).await.expect("the event should have an item");
+    item.read_receipts().keys().cloned().collect()
+}
+
+#[async_test]
+async fn test_state_events_of_others_are_not_reads_with_message_like_tracking() {
+    // With `TimelineReadReceiptTracking::MessageLikeEvents` a state event can't
+    // hold a receipt. If it took an implicit one, the receipt would move back
+    // onto the previous message, which its sender may never have opened.
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let own_user_id = client.user_id().unwrap();
+
+    let timeline = room
+        .timeline_builder()
+        .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let read_by_carol = event_id!("$1_read_by_carol");
+    let bobs_message = event_id!("$2_bobs_message");
+    let unread = event_id!("$3_unread_message");
+
+    let f = EventFactory::new().room(room_id);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("One").sender(own_user_id).event_id(read_by_carol))
+                .add_timeline_event(f.text_msg("Two").sender(*BOB).event_id(bobs_message))
+                .add_timeline_event(f.text_msg("Three").sender(own_user_id).event_id(unread)),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_receipt(
+                f.read_receipts()
+                    .add(read_by_carol, *CAROL, EventReceiptType::Read, ReceiptThread::Unthreaded)
+                    .into_event(),
+            ),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    assert_eq!(receipts_shown_on(&timeline, read_by_carol).await, [CAROL.to_owned()]);
+    assert_eq!(receipts_shown_on(&timeline, bobs_message).await, [BOB.to_owned()]);
+    assert!(receipts_shown_on(&timeline, unread).await.is_empty());
+
+    // Bob changes his name and his photo, and writes a call membership, and
+    // Carol leaves. None of them has read the last message.
+    let avatar = mxc_uri!("mxc://example.org/bob");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.member(*BOB).display_name("Bobby").event_id(event_id!("$4_name")),
+                )
+                .add_timeline_event(
+                    f.member(*BOB).avatar_url(avatar).event_id(event_id!("$5_photo")),
+                )
+                .add_timeline_event(
+                    f.call_membership_state((*BOB).to_owned(), "DEVICE".to_owned())
+                        .event_id(event_id!("$6_call")),
+                )
+                .add_timeline_event(f.member(*CAROL).leave().event_id(event_id!("$7_left"))),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    assert!(receipts_shown_on(&timeline, unread).await.is_empty());
+    assert_eq!(receipts_shown_on(&timeline, read_by_carol).await, [CAROL.to_owned()]);
+    assert_eq!(receipts_shown_on(&timeline, bobs_message).await, [BOB.to_owned()]);
+
+    // The real receipts stay where they were too.
+    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_event_id, bobs_message);
+    let bob_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_timeline_event, bobs_message);
+    let (carol_receipt_event_id, _) = timeline.latest_user_read_receipt(*CAROL).await.unwrap();
+    assert_eq!(carol_receipt_event_id, read_by_carol);
+
+    // A message is still a read: for someone who sends no read receipts, such
+    // as an agent, it's the only one.
+    let reply = event_id!("$8_reply");
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("Four").sender(*BOB).event_id(reply)),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    assert_eq!(receipts_shown_on(&timeline, reply).await, [BOB.to_owned()]);
+    assert!(receipts_shown_on(&timeline, bobs_message).await.is_empty());
+    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_event_id, reply);
+}
+
+#[async_test]
+async fn test_malformed_state_event_of_other_is_not_a_read_with_message_like_tracking() {
+    // A state event that doesn't parse gets a timeline item of its own, but it
+    // can no more hold a receipt than a state event that parses.
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let own_user_id = client.user_id().unwrap();
+
+    let timeline = room
+        .timeline_builder()
+        .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let bobs_message = event_id!("$1_bobs_message");
+    let unread = event_id!("$2_unread_message");
+
+    let f = EventFactory::new().room(room_id);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("One").sender(*BOB).event_id(bobs_message))
+                .add_timeline_event(f.text_msg("Two").sender(own_user_id).event_id(unread))
+                .add_timeline_event(
+                    Raw::new(&json!({
+                        "content": { "name": 42 },
+                        "event_id": "$3_malformed",
+                        "origin_server_ts": 152037280,
+                        "sender": *BOB,
+                        "state_key": "",
+                        "type": "m.room.name",
+                    }))
+                    .unwrap()
+                    .cast_unchecked::<AnySyncTimelineEvent>(),
+                ),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    assert!(timeline.item_by_event_id(event_id!("$3_malformed")).await.is_some());
+    assert_eq!(receipts_shown_on(&timeline, bobs_message).await, [BOB.to_owned()]);
+    assert!(receipts_shown_on(&timeline, unread).await.is_empty());
+    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_event_id, bobs_message);
+}
+
+#[async_test]
+async fn test_own_state_event_is_a_read_with_message_like_tracking() {
+    // Our own receipt is what keeps the local unread state right, and anything
+    // we send counts as read, a state event included.
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let own_user_id = client.user_id().unwrap();
+
+    let timeline = room
+        .timeline_builder()
+        .track_read_marker_and_receipts(TimelineReadReceiptTracking::MessageLikeEvents)
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let message = event_id!("$1_message");
+    let own_state_event = event_id!("$2_own_state_event");
+
+    let f = EventFactory::new().room(room_id);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("One").sender(*BOB).event_id(message))
+                .add_timeline_event(
+                    f.room_name("Party Room").sender(own_user_id).event_id(own_state_event),
+                ),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    let (own_receipt_event_id, _) = timeline.latest_user_read_receipt(own_user_id).await.unwrap();
+    assert_eq!(own_receipt_event_id, own_state_event);
+    let own_receipt_timeline_event =
+        timeline.latest_user_read_receipt_timeline_event_id(own_user_id).await.unwrap();
+    assert_eq!(own_receipt_timeline_event, message);
+}
+
+#[async_test]
+async fn test_state_event_of_other_holds_its_receipt_with_all_events_tracking() {
+    // With `TimelineReadReceiptTracking::AllEvents` a state event can hold a
+    // receipt, so it keeps its implicit one.
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let own_user_id = client.user_id().unwrap();
+
+    let timeline = room
+        .timeline_builder()
+        .track_read_marker_and_receipts(TimelineReadReceiptTracking::AllEvents)
+        .build()
+        .await
+        .unwrap();
+    let (_, mut timeline_stream) = timeline.subscribe().await;
+
+    let message = event_id!("$1_message");
+    let state_event = event_id!("$2_state_event");
+
+    let f = EventFactory::new().room(room_id);
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("One").sender(own_user_id).event_id(message))
+                .add_timeline_event(f.room_name("Party Room").sender(*BOB).event_id(state_event)),
+        )
+        .await;
+    assert_let_timeout!(Some(_) = timeline_stream.next());
+
+    assert!(receipts_shown_on(&timeline, message).await.is_empty());
+    assert_eq!(receipts_shown_on(&timeline, state_event).await, [BOB.to_owned()]);
+    let (bob_receipt_event_id, _) = timeline.latest_user_read_receipt(*BOB).await.unwrap();
+    assert_eq!(bob_receipt_event_id, state_event);
 }

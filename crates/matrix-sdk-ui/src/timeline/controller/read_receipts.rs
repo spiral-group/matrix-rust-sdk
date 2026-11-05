@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: an event that can't hold a read receipt
+// adds no implicit one for another user.
+
 use std::{cmp::Ordering, collections::HashMap};
 
 use futures_core::Stream;
@@ -646,17 +649,31 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
     /// our own user, but these events are used to reset the notification count,
     /// so we need to handle them locally too. For that we create an "implicit"
     /// read receipt, compared to the "explicit" ones sent by the client.
+    ///
+    /// For another user, `can_show_read_receipts` has to be true. An event that
+    /// can't hold a receipt would fold it onto the previous event that can, so
+    /// a state event (a name change, a join, a call membership) would mark a
+    /// message as read by someone who never opened it. Our own user is exempt:
+    /// anything we send counts as read, and nothing shows our own receipt.
     pub(super) fn maybe_add_implicit_read_receipt(
         &mut self,
         event_id: &EventId,
         sender: Option<&UserId>,
         timestamp: Option<MilliSecondsSinceUnixEpoch>,
+        can_show_read_receipts: bool,
     ) {
         let (Some(user_id), Some(timestamp)) = (sender, timestamp) else {
             // We cannot add a read receipt if we do not know the user or the
             // timestamp.
             return;
         };
+
+        let is_own_event = user_id == self.meta.own_user_id;
+
+        if !is_own_event && !can_show_read_receipts {
+            trace!(%user_id, %event_id, "event can't hold a read receipt, not adding an implicit one");
+            return;
+        }
 
         trace!(%user_id, %event_id, "adding implicit read receipt");
 
@@ -665,8 +682,6 @@ impl<P: RoomDataProvider> TimelineStateTransaction<'_, P> {
 
         let full_receipt =
             FullReceipt { event_id, user_id, receipt_type: ReceiptType::Read, receipt: &receipt };
-
-        let is_own_event = sender.is_some_and(|sender| sender == self.meta.own_user_id);
 
         self.meta.read_receipts.maybe_update_read_receipt(
             full_receipt,
