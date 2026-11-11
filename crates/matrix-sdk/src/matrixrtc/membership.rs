@@ -29,6 +29,10 @@
 //!   bytes on the wire: ruma's serialisation omits `membershipID` and
 //!   `m.call.intent`, both of which Element Call reads. The pin test in this
 //!   file is what keeps that shape honest.
+//!
+//! One field is read from the RAW content instead of ruma's: the participant's
+//! language ([`MEMBERSHIP_LANGUAGE_FIELD`]). It is a namespaced extension that
+//! no MSC defines yet, and ruma's typed content drops keys it does not know.
 
 use std::time::Duration;
 
@@ -52,6 +56,23 @@ pub const DEFAULT_MEMBERSHIP_EXPIRY: Duration = Duration::from_secs(4 * 60 * 60)
 
 /// Transport type identifier for a LiveKit SFU.
 pub const LIVEKIT_TRANSPORT_TYPE: &str = "livekit";
+
+/// Top-level membership key carrying the language this participant speaks and
+/// wants to hear, e.g. `"uk"`, `"zh-Hans"` or `"pt-BR"`.
+///
+/// This is a namespaced extension, not part of MSC3401/MSC4143: no MSC defines
+/// a participant language yet. It lives next to the standard fields of the
+/// per-device membership so it shares the membership's lifetime: a leave
+/// (`{}`) removes it from the room's current state.
+///
+/// The SDK treats the value as opaque. It is written exactly as the
+/// application gives it and read back exactly as published — no case folding,
+/// no check against any list of languages. Deciding what a code means, and
+/// what an unknown one degrades to, is the application's job.
+///
+/// Like every state event, it is NOT end-to-end encrypted: the homeserver and
+/// every member of the room can read it.
+pub const MEMBERSHIP_LANGUAGE_FIELD: &str = "com.matrixagent.language";
 
 /// A LiveKit transport as advertised inside `foci_preferred`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +158,13 @@ pub struct RtcMembershipContent {
     /// Soft indication of whether this participant joined for audio or video.
     #[serde(rename = "m.call.intent", default, skip_serializing_if = "Option::is_none")]
     pub call_intent: Option<CallIntent>,
+
+    /// The language this participant publishes, under
+    /// [`MEMBERSHIP_LANGUAGE_FIELD`]. Omitted from the wire when `None`.
+    ///
+    /// The `rename` must stay equal to the constant; a test pins the two.
+    #[serde(rename = "com.matrixagent.language", default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 impl RtcMembershipContent {
@@ -161,6 +189,7 @@ impl RtcMembershipContent {
             foci_preferred,
             created_ts,
             call_intent,
+            language: None,
         }
     }
 }
@@ -198,6 +227,14 @@ pub struct RtcMembership {
     /// device carries a NEW value while the identity stays the same, which is
     /// how the session tells "still here" from "here again".
     pub created_ts: MilliSecondsSinceUnixEpoch,
+
+    /// The language this participant published under
+    /// [`MEMBERSHIP_LANGUAGE_FIELD`], exactly as published.
+    ///
+    /// `None` when the key is absent, empty or not a string. Any other string
+    /// is passed through unvalidated: whether it names a language the
+    /// application knows is the application's call.
+    pub language: Option<String>,
 }
 
 impl RtcMembership {
@@ -223,18 +260,24 @@ impl RtcMembership {
 /// Returns nothing for leave events (empty content), for non-call
 /// applications, and for events whose state key does not belong to the sender
 /// — which is what stops a member publishing a membership on somebody else's
-/// behalf.
+/// behalf, and with it a language on somebody else's behalf.
+///
+/// The participant's language is read from the raw content
+/// ([`published_language`]): ruma's typed content drops the key.
 pub fn parse_membership(
     state_key: &str,
     sender: &UserId,
     origin_server_ts: MilliSecondsSinceUnixEpoch,
     content: &serde_json::value::RawValue,
 ) -> Vec<RtcMembership> {
-    let Ok(content) = serde_json::from_str::<CallMemberEventContent>(content.get()) else {
+    let Ok(typed) = serde_json::from_str::<CallMemberEventContent>(content.get()) else {
         return Vec::new();
     };
 
-    content
+    // One event carries one device's membership, so one language.
+    let language = published_language(content);
+
+    typed
         .active_memberships(Some(origin_server_ts))
         .into_iter()
         .filter(|membership| membership.is_room_call())
@@ -253,9 +296,34 @@ pub fn parse_membership(
                 user_id: sender.to_owned(),
                 device_id,
                 created_ts: membership.created_ts().unwrap_or(origin_server_ts),
+                language: language.clone(),
             })
         })
         .collect()
+}
+
+/// Read the participant's language ([`MEMBERSHIP_LANGUAGE_FIELD`]) from the
+/// raw content of a membership event.
+///
+/// Lenient by design: a missing key, `null`, an empty string or a value of
+/// another JSON type all read as "no published language" rather than failing
+/// the membership, so a malformed language can never take somebody out of the
+/// call. A string is returned verbatim.
+///
+/// This does NOT check who sent the content. Callers must only apply it to
+/// content whose sender owns the state key, as [`parse_membership`] does.
+pub fn published_language(content: &serde_json::value::RawValue) -> Option<String> {
+    #[derive(Deserialize)]
+    struct LanguageExtension {
+        #[serde(rename = "com.matrixagent.language", default)]
+        language: Option<serde_json::Value>,
+    }
+
+    let extension = serde_json::from_str::<LanguageExtension>(content.get()).ok()?;
+    match extension.language? {
+        serde_json::Value::String(language) if !language.is_empty() => Some(language),
+        _ => None,
+    }
 }
 
 fn duration_to_millis(duration: Duration) -> UInt {
@@ -399,5 +467,147 @@ mod tests {
         assert!(membership_with(1_000, long_ago).is_empty());
         // Created a minute ago with the default four-hour lifetime: live.
         assert_eq!(membership_with(14_400_000, long_ago).len(), 1);
+    }
+
+    fn membership_with_language(language: serde_json::Value) -> Box<serde_json::value::RawValue> {
+        let mut content = json!({
+            "application": "m.call",
+            "call_id": "",
+            "scope": "m.room",
+            "device_id": "DEVICEID",
+            "membershipID": "@alice:example.org:DEVICEID",
+            "expires": 14_400_000,
+            "focus_active": { "type": "livekit", "focus_selection": "oldest_membership" },
+            "foci_preferred": [],
+        });
+        content[MEMBERSHIP_LANGUAGE_FIELD] = language;
+        serde_json::value::to_raw_value(&content).unwrap()
+    }
+
+    fn alices_memberships(content: &serde_json::value::RawValue) -> Vec<RtcMembership> {
+        parse_membership(
+            "_@alice:example.org_DEVICEID_m.call",
+            user_id!("@alice:example.org"),
+            MilliSecondsSinceUnixEpoch::now(),
+            content,
+        )
+    }
+
+    /// The serde `rename` cannot name the constant, so pin them together: a
+    /// drift would write one key and document another.
+    #[test]
+    fn the_language_field_serialises_under_the_documented_key() {
+        let mut content = RtcMembershipContent::new(
+            user_id!("@alice:example.org"),
+            device_id!("DEVICEID"),
+            ActiveFocus::oldest_membership(),
+            Vec::new(),
+            DEFAULT_MEMBERSHIP_EXPIRY,
+            None,
+            None,
+        );
+        content.language = Some("uk".to_owned());
+
+        let value = serde_json::to_value(&content).unwrap();
+        assert_eq!(value[MEMBERSHIP_LANGUAGE_FIELD], json!("uk"));
+    }
+
+    #[test]
+    fn a_published_language_round_trips_verbatim() {
+        let mut content = RtcMembershipContent::new(
+            user_id!("@alice:example.org"),
+            device_id!("DEVICEID"),
+            ActiveFocus::oldest_membership(),
+            vec![LiveKitFocus::new(
+                "https://rtc.example.org/livekit/jwt",
+                Some("!room:example.org".to_owned()),
+            )],
+            DEFAULT_MEMBERSHIP_EXPIRY,
+            None,
+            Some(CallIntent::Audio),
+        );
+        // Mixed case on purpose: codes are compared in their exact form, so
+        // the SDK must never fold them.
+        content.language = Some("zh-Hans".to_owned());
+        let raw = serde_json::value::to_raw_value(&content).unwrap();
+
+        let memberships = alices_memberships(&raw);
+
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].language.as_deref(), Some("zh-Hans"));
+    }
+
+    #[test]
+    fn a_membership_without_the_key_has_no_language() {
+        // The pin test above already shows the writer omits the key for
+        // `None`; this is the reader's half.
+        let content = serde_json::value::to_raw_value(&json!({
+            "application": "m.call",
+            "call_id": "",
+            "scope": "m.room",
+            "device_id": "DEVICEID",
+            "membershipID": "@alice:example.org:DEVICEID",
+            "expires": 14_400_000,
+            "focus_active": { "type": "livekit", "focus_selection": "oldest_membership" },
+            "foci_preferred": [],
+        }))
+        .unwrap();
+
+        let memberships = alices_memberships(&content);
+
+        assert_eq!(memberships.len(), 1, "the membership itself still parses");
+        assert_eq!(memberships[0].language, None);
+    }
+
+    /// The SDK does not know the application's language list: an unknown
+    /// code reaches the application as written, and deciding that it means
+    /// "no language" is the application's job.
+    #[test]
+    fn an_unknown_language_string_is_passed_through_unvalidated() {
+        let content = membership_with_language(json!("not a language ✓"));
+
+        let memberships = alices_memberships(&content);
+
+        assert_eq!(memberships[0].language.as_deref(), Some("not a language ✓"));
+    }
+
+    /// A value that is not a string, or an empty one, is no language — and it
+    /// must never cost the participant their place in the call.
+    #[test]
+    fn a_malformed_language_reads_as_none_and_keeps_the_membership() {
+        for malformed in [json!(42), json!({ "code": "uk" }), json!(["uk"]), json!(null), json!("")]
+        {
+            let content = membership_with_language(malformed.clone());
+
+            let memberships = alices_memberships(&content);
+
+            assert_eq!(memberships.len(), 1, "{malformed} must not drop the membership");
+            assert_eq!(memberships[0].language, None, "{malformed} is no language");
+        }
+    }
+
+    /// Bob publishing under Alice's state key must not give Alice a language
+    /// (nor a place in the call).
+    #[test]
+    fn a_forged_membership_yields_no_language() {
+        let content = membership_with_language(json!("uk"));
+
+        let memberships = parse_membership(
+            "_@alice:example.org_DEVICEID_m.call",
+            user_id!("@bob:example.org"),
+            MilliSecondsSinceUnixEpoch::now(),
+            &content,
+        );
+
+        assert!(memberships.is_empty());
+    }
+
+    /// A leave is `{}`: nothing survives it, the language included.
+    #[test]
+    fn a_leave_carries_no_language() {
+        let content = serde_json::value::to_raw_value(&json!({})).unwrap();
+
+        assert_eq!(published_language(&content), None);
+        assert!(alices_memberships(&content).is_empty());
     }
 }

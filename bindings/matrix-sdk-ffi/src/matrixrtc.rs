@@ -65,6 +65,15 @@ pub struct MatrixRtcJoinConfiguration {
 
     /// Soft indication of whether the call starts as audio or video.
     pub call_intent: Option<MatrixRtcCallIntent>,
+
+    /// The language this participant speaks and wants to hear, published in
+    /// the membership verbatim (e.g. `"uk"`, `"zh-Hans"`, `"pt-BR"`; never
+    /// case-folded). `None` or an empty string publishes no language.
+    ///
+    /// Membership state is not end-to-end encrypted: the homeserver and every
+    /// room member can read it.
+    #[uniffi(default = None)]
+    pub language: Option<String>,
 }
 
 impl From<MatrixRtcJoinConfiguration> for SdkJoinConfiguration {
@@ -74,6 +83,7 @@ impl From<MatrixRtcJoinConfiguration> for SdkJoinConfiguration {
             encrypt_media: value.encrypt_media,
             notification_type: value.notification_type.map(Into::into),
             call_intent: value.call_intent.map(Into::into),
+            language: value.language,
         }
     }
 }
@@ -125,6 +135,16 @@ pub struct MatrixRtcMembership {
 
     /// The identity this participant uses on the SFU.
     pub identity: String,
+
+    /// The language this participant published, exactly as published.
+    ///
+    /// `None` when they published none, or a value that is not a non-empty
+    /// string. Any string is passed through unvalidated: the caller decides
+    /// whether it names a language it knows. Only ever the participant's own
+    /// claim — a membership published under somebody else's state key is not
+    /// a participant at all.
+    #[uniffi(default = None)]
+    pub language: Option<String>,
 }
 
 impl From<&SdkRtcMembership> for MatrixRtcMembership {
@@ -133,6 +153,7 @@ impl From<&SdkRtcMembership> for MatrixRtcMembership {
             user_id: value.user_id.to_string(),
             device_id: value.device_id.to_string(),
             identity: value.livekit_identity(),
+            language: value.language.clone(),
         }
     }
 }
@@ -285,6 +306,17 @@ impl MatrixRtcSession {
         call_intent: MatrixRtcCallIntent,
     ) -> Result<(), ClientError> {
         Ok(self.inner.update_call_intent(call_intent.into()).await?)
+    }
+
+    /// Update the language advertised by our live membership; `None` (or an
+    /// empty string) removes it.
+    ///
+    /// Re-publishes the membership with everything else unchanged — expiry,
+    /// transport, intent, the staged delayed leave — and sends nothing when
+    /// the language is already the one published. Fails when not joined;
+    /// the initial language goes in [`MatrixRtcJoinConfiguration::language`].
+    pub async fn update_language(&self, language: Option<String>) -> Result<(), ClientError> {
+        Ok(self.inner.update_language(language).await?)
     }
 
     /// Withdraw our membership and stop driving the session.

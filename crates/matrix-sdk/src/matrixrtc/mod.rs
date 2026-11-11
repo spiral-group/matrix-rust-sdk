@@ -77,7 +77,7 @@ pub mod session;
 pub mod transport;
 
 pub use keys::{ReceivedRtcEncryptionKey, RtcEncryptionKey};
-pub use membership::{LiveKitFocus, RtcMembership};
+pub use membership::{LiveKitFocus, MEMBERSHIP_LANGUAGE_FIELD, RtcMembership};
 pub use session::{
     JoinConfiguration, LeaveReason, MatrixRtcSession, MatrixRtcUpdate, RtcCallIntent,
     RtcNotificationType,

@@ -176,6 +176,15 @@ pub struct JoinConfiguration {
 
     /// Soft indication of whether the call starts as audio or video.
     pub call_intent: Option<RtcCallIntent>,
+
+    /// The language this participant speaks and wants to hear, published in
+    /// the membership under [`MEMBERSHIP_LANGUAGE_FIELD`].
+    ///
+    /// Written verbatim (an empty string counts as `None`); change it while
+    /// joined with [`MatrixRtcSession::update_language`].
+    ///
+    /// [`MEMBERSHIP_LANGUAGE_FIELD`]: super::membership::MEMBERSHIP_LANGUAGE_FIELD
+    pub language: Option<String>,
 }
 
 impl Default for JoinConfiguration {
@@ -185,8 +194,27 @@ impl Default for JoinConfiguration {
             encrypt_media: true,
             notification_type: None,
             call_intent: None,
+            language: None,
         }
     }
+}
+
+/// The fields of our membership that belong to the participant rather than
+/// to the protocol: what every publish — the join, an intent or language
+/// change, a refresh, a self-heal — must carry, and only the update that
+/// owns a field may change it.
+///
+/// Kept together so a publish path cannot forget one: each of them reads
+/// this whole value from the joined state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ParticipantFields {
+    call_intent: Option<RtcCallIntent>,
+    language: Option<String>,
+}
+
+/// An empty language is no language: never publish `""`.
+fn normalise_language(language: Option<String>) -> Option<String> {
+    language.filter(|language| !language.is_empty())
 }
 
 /// Our participation in the MatrixRTC session of a room.
@@ -214,9 +242,11 @@ struct SessionInner {
     /// `OwnEncryptionKeyChanged` after a newer one, leaving the media layer on
     /// a superseded key with nothing to correct it.
     reconcile: Mutex<()>,
-    /// Serialises call-intent membership updates without holding `state`
-    /// across the homeserver request.
-    call_intent_update: Mutex<()>,
+    /// Serialises every re-publish of our membership (intent and language
+    /// changes, refreshes, the self-heal) without holding `state` across the
+    /// homeserver request, so two of them cannot interleave and publish a
+    /// stale copy of the other's field.
+    membership_update: Mutex<()>,
     updates: broadcast::Sender<MatrixRtcUpdate>,
 }
 
@@ -255,7 +285,9 @@ struct JoinedState {
     /// fresh session may already have published its own by the time a
     /// slow first join comes back (audit 2026-09-05, SDK P2).
     membership_event_id: OwnedEventId,
-    call_intent: Option<RtcCallIntent>,
+    /// What every re-publish of our membership carries; see
+    /// [`ParticipantFields`].
+    participant: ParticipantFields,
     /// The `m.rtc.notification` this join sent, if it rang the room. Callers
     /// need it to observe MSC4310 decline events for their own ring.
     rtc_notification_event_id: Option<OwnedEventId>,
@@ -315,7 +347,7 @@ impl MatrixRtcSession {
             room,
             inner: Arc::new(SessionInner {
                 reconcile: Mutex::new(()),
-                call_intent_update: Mutex::new(()),
+                membership_update: Mutex::new(()),
                 user_id,
                 device_id,
                 state: Mutex::new(SessionState::Idle),
@@ -479,8 +511,33 @@ impl MatrixRtcSession {
     /// Intent belongs to this participant, not to the room: one participant
     /// may publish video while another remains audio-only.
     pub async fn update_call_intent(&self, call_intent: RtcCallIntent) -> Result<()> {
-        let _intent_update = self.inner.call_intent_update.lock().await;
-        let (transport, expiry, created_ts, current_intent) = {
+        self.update_participant_fields(|participant| participant.call_intent = Some(call_intent))
+            .await
+    }
+
+    /// Update the language advertised by our live membership, under
+    /// [`MEMBERSHIP_LANGUAGE_FIELD`]; `None` (or an empty string) removes it.
+    ///
+    /// Like [`Self::update_call_intent`], this re-publishes the membership
+    /// with everything else unchanged: the same expiry window (the cached
+    /// `created_ts` anchor, never a new one, so the change cannot read as a
+    /// rejoin), the same transport and intent, and the staged delayed leave
+    /// keeps beating. Setting the language it already has sends nothing.
+    ///
+    /// [`MEMBERSHIP_LANGUAGE_FIELD`]: super::membership::MEMBERSHIP_LANGUAGE_FIELD
+    pub async fn update_language(&self, language: Option<String>) -> Result<()> {
+        let language = normalise_language(language);
+        self.update_participant_fields(move |participant| participant.language = language).await
+    }
+
+    /// Apply `change` to the participant fields of our live membership and
+    /// re-publish it, unless the change changes nothing.
+    async fn update_participant_fields(
+        &self,
+        change: impl FnOnce(&mut ParticipantFields),
+    ) -> Result<()> {
+        let _membership_update = self.inner.membership_update.lock().await;
+        let (transport, expiry, created_ts, current) = {
             let state = self.inner.state.lock().await;
             let SessionState::Joined(joined) = &*state else {
                 return Err(Error::NotJoined);
@@ -489,15 +546,17 @@ impl MatrixRtcSession {
                 joined.transport.clone(),
                 joined.membership_expiry,
                 joined.membership_created_ts,
-                joined.call_intent,
+                joined.participant.clone(),
             )
         };
 
-        if current_intent == Some(call_intent) {
+        let mut updated = current.clone();
+        change(&mut updated);
+        if updated == current {
             return Ok(());
         }
 
-        self.publish_membership(&transport, expiry, Some(created_ts), Some(call_intent)).await?;
+        self.publish_membership(&transport, expiry, Some(created_ts), &updated).await?;
 
         let mut state = self.inner.state.lock().await;
         let SessionState::Joined(joined) = &mut *state else {
@@ -507,7 +566,9 @@ impl MatrixRtcSession {
             self.publish_leave().await?;
             return Ok(());
         };
-        joined.call_intent = Some(call_intent);
+        // Every writer of this field holds `membership_update`, so nothing
+        // changed it while the PUT was out.
+        joined.participant = updated;
 
         Ok(())
     }
@@ -518,6 +579,10 @@ impl MatrixRtcSession {
         let client = self.room.client();
         let transport = LiveKitTransport::discover(&client).await?;
         let membership_created_ts = MilliSecondsSinceUnixEpoch::now();
+        let participant = ParticipantFields {
+            call_intent: configuration.call_intent,
+            language: normalise_language(configuration.language.clone()),
+        };
 
         // Installed BEFORE the membership is published (call audit
         // 2026-09-05, SDK F3): a peer that is already in the call — the
@@ -534,12 +599,7 @@ impl MatrixRtcSession {
         }
 
         let membership_event_id = match self
-            .publish_membership(
-                &transport,
-                configuration.membership_expiry,
-                None,
-                configuration.call_intent,
-            )
+            .publish_membership(&transport, configuration.membership_expiry, None, &participant)
             .await
         {
             Ok(event_id) => event_id,
@@ -604,7 +664,7 @@ impl MatrixRtcSession {
             own_membership_seen: false,
             joined_at: std::time::Instant::now(),
             membership_event_id: membership_event_id.clone(),
-            call_intent: configuration.call_intent,
+            participant,
             rtc_notification_event_id,
             own_key: None,
             own_key_created_at: MilliSecondsSinceUnixEpoch::now(),
@@ -714,9 +774,9 @@ impl MatrixRtcSession {
         transport: &LiveKitTransport,
         expiry: Duration,
         created_ts: Option<MilliSecondsSinceUnixEpoch>,
-        call_intent: Option<RtcCallIntent>,
+        participant: &ParticipantFields,
     ) -> Result<OwnedEventId> {
-        let content = RtcMembershipContent::new(
+        let mut content = RtcMembershipContent::new(
             &self.inner.user_id,
             &self.inner.device_id,
             ActiveFocus::oldest_membership(),
@@ -726,8 +786,9 @@ impl MatrixRtcSession {
             )],
             expiry,
             created_ts,
-            call_intent.map(Into::into),
+            participant.call_intent.map(Into::into),
         );
+        content.language = participant.language.clone();
 
         let state_key = membership_state_key(&self.inner.user_id, &self.inner.device_id);
 
@@ -982,18 +1043,18 @@ impl MatrixRtcSession {
                 let mut attempt = 0;
                 loop {
                     let outcome = {
-                        let _intent_update = session.inner.call_intent_update.lock().await;
-                        let (transport, call_intent) = {
+                        let _membership_update = session.inner.membership_update.lock().await;
+                        let (transport, participant) = {
                             let state = session.inner.state.lock().await;
                             match &*state {
                                 SessionState::Joined(joined) => {
-                                    (joined.transport.clone(), joined.call_intent)
+                                    (joined.transport.clone(), joined.participant.clone())
                                 }
                                 SessionState::Idle | SessionState::Joining => return,
                             }
                         };
                         session
-                            .refresh_membership_once(&transport, expiry, created_ts, call_intent)
+                            .refresh_membership_once(&transport, expiry, created_ts, &participant)
                             .await
                     };
                     match outcome {
@@ -1033,9 +1094,9 @@ impl MatrixRtcSession {
         transport: &LiveKitTransport,
         expiry: Duration,
         created_ts: MilliSecondsSinceUnixEpoch,
-        call_intent: Option<RtcCallIntent>,
+        participant: &ParticipantFields,
     ) -> Result<()> {
-        self.publish_membership(transport, expiry, Some(created_ts), call_intent).await?;
+        self.publish_membership(transport, expiry, Some(created_ts), participant).await?;
 
         let mut state = self.inner.state.lock().await;
         if let SessionState::Joined(joined) = &mut *state {
@@ -1306,16 +1367,16 @@ impl MatrixRtcSession {
     /// the cached anchor follows it so a later call-intent update does not
     /// republish the join-time stamp and rewind the expiry.
     async fn republish_membership(&self) {
-        let _intent_update = self.inner.call_intent_update.lock().await;
+        let _membership_update = self.inner.membership_update.lock().await;
         // Re-check under the lock: `leave()` may have run while this task was
         // waiting to be scheduled.
-        let (transport, expiry, call_intent, stale_delay_id) = {
+        let (transport, expiry, participant, stale_delay_id) = {
             let state = self.inner.state.lock().await;
             let SessionState::Joined(joined) = &*state else { return };
             (
                 joined.transport.clone(),
                 joined.membership_expiry,
-                joined.call_intent,
+                joined.participant.clone(),
                 joined.delay_id.clone(),
             )
         };
@@ -1330,7 +1391,7 @@ impl MatrixRtcSession {
 
         let created_ts = MilliSecondsSinceUnixEpoch::now();
         if let Err(error) =
-            self.publish_membership(&transport, expiry, Some(created_ts), call_intent).await
+            self.publish_membership(&transport, expiry, Some(created_ts), &participant).await
         {
             warn!("Could not re-publish the MatrixRTC membership: {error}");
             return;
@@ -2198,10 +2259,12 @@ mod tests {
 
         // Drive one refresh publish the way the loop does, without waiting
         // out the real interval.
-        let (transport, call_intent) = {
+        let (transport, participant) = {
             let state = session.inner.state.lock().await;
             match &*state {
-                SessionState::Joined(joined) => (joined.transport.clone(), joined.call_intent),
+                SessionState::Joined(joined) => {
+                    (joined.transport.clone(), joined.participant.clone())
+                }
                 _ => panic!("expected to be joined"),
             }
         };
@@ -2213,7 +2276,7 @@ mod tests {
                 &transport,
                 Duration::from_secs(4 * 60 * 60),
                 refresh_created_ts,
-                call_intent,
+                &participant,
             )
             .await
             .unwrap();
@@ -2870,6 +2933,410 @@ mod reconciliation_tests {
             &delay_id_before,
         );
         assert_eq!(cancels_after, cancels_before + 1, "the stale delayed leave was cancelled");
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod language_tests {
+    //! Brief 0085 (ADR-0094 A.1): the participant's language in the
+    //! membership — published at join, changed mid-call without disturbing
+    //! anything else the membership carries, and read for every member.
+
+    use matrix_sdk_test::{JoinedRoomBuilder, async_test};
+    use ruma::{event_id, events::AnySyncStateEvent, room_id};
+    use serde_json::{Value as JsonValue, json};
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path_regex, query_param},
+    };
+
+    use super::*;
+    use crate::{
+        matrixrtc::membership::MEMBERSHIP_LANGUAGE_FIELD, test_utils::mocks::MatrixMockServer,
+    };
+
+    const SERVICE_URL: &str = "https://rtc.example.org/livekit/jwt";
+
+    fn room() -> &'static ruma::RoomId {
+        room_id!("!room:localhost")
+    }
+
+    async fn mock_transports(server: &MatrixMockServer) {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/unstable/org.matrix.msc4143/rtc/transports"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "rtc_transports": [{ "type": "livekit", "livekit_service_url": SERVICE_URL }]
+            })))
+            .mount(server.server())
+            .await;
+    }
+
+    /// Every delayed leave staged during the test, counted. Mounted before
+    /// the generic state mock, which would otherwise answer the staging too.
+    async fn mock_delayed_leaves(server: &MatrixMockServer) -> wiremock::MockGuard {
+        let stagings = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/state/.*/.*"))
+            .and(query_param("org.matrix.msc4140.delay", "10000"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = stagings.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "delay_id": format!("delay-{}", n + 1) }))
+            })
+            .mount_as_scoped(server.server())
+            .await
+    }
+
+    async fn joined_with(
+        server: &MatrixMockServer,
+        configuration: JoinConfiguration,
+    ) -> (crate::Client, MatrixRtcSession) {
+        let client = server.client_builder().build().await;
+        mock_transports(server).await;
+        let room = server.sync_joined_room(&client, room()).await;
+        server.mock_room_send_state().ok(event_id!("$membership")).mount().await;
+        let session = room.matrix_rtc_session().unwrap();
+        session.join(configuration).await.unwrap();
+        (client, session)
+    }
+
+    /// The bodies of every membership PUT (not a delayed-leave staging), in
+    /// the order the server received them.
+    async fn published_memberships(server: &MatrixMockServer) -> Vec<JsonValue> {
+        server
+            .server()
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.method == wiremock::http::Method::PUT
+                    && request.url.path().contains("/state/org.matrix.msc3401.call.member/")
+                    && !request.url.query().unwrap_or_default().contains("msc4140.delay")
+            })
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect()
+    }
+
+    fn delay_id(session: &MatrixRtcSession) -> Option<String> {
+        let state = session.inner.state.try_lock().expect("state is not held across awaits");
+        match &*state {
+            SessionState::Joined(joined) => joined.delay_id.clone(),
+            _ => panic!("expected to be joined"),
+        }
+    }
+
+    fn created_ts(session: &MatrixRtcSession) -> MilliSecondsSinceUnixEpoch {
+        let state = session.inner.state.try_lock().expect("state is not held across awaits");
+        match &*state {
+            SessionState::Joined(joined) => joined.membership_created_ts,
+            _ => panic!("expected to be joined"),
+        }
+    }
+
+    /// A membership event exactly as a client would put it on the wire, so
+    /// the extension key survives (the event factory builds ruma's typed
+    /// content, which has no place for it).
+    fn raw_membership(
+        sender: &str,
+        state_key: &str,
+        device_id: &str,
+        event_id: &str,
+        language: Option<&str>,
+    ) -> Raw<AnySyncStateEvent> {
+        let mut content = json!({
+            "application": "m.call",
+            "call_id": "",
+            "scope": "m.room",
+            "device_id": device_id,
+            "membershipID": format!("{sender}:{device_id}"),
+            "expires": 14_400_000,
+            "created_ts": MilliSecondsSinceUnixEpoch::now(),
+            "focus_active": { "type": "livekit", "focus_selection": "oldest_membership" },
+            "foci_preferred": [{
+                "type": "livekit",
+                "livekit_service_url": SERVICE_URL,
+                "livekit_alias": room().as_str(),
+            }],
+        });
+        if let Some(language) = language {
+            content[MEMBERSHIP_LANGUAGE_FIELD] = json!(language);
+        }
+        Raw::new(&json!({
+            "type": CALL_MEMBER_EVENT_TYPE,
+            "state_key": state_key,
+            "sender": sender,
+            "event_id": event_id,
+            "origin_server_ts": MilliSecondsSinceUnixEpoch::now(),
+            "content": content,
+        }))
+        .unwrap()
+        .cast_unchecked()
+    }
+
+    #[async_test]
+    async fn test_join_publishes_the_configured_language() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+
+        let (_client, _session) = joined_with(
+            &server,
+            JoinConfiguration { language: Some("pt-BR".to_owned()), ..Default::default() },
+        )
+        .await;
+
+        let published = published_memberships(&server).await;
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0][MEMBERSHIP_LANGUAGE_FIELD], json!("pt-BR"));
+    }
+
+    #[async_test]
+    async fn test_join_without_a_language_publishes_no_key() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+
+        // An empty language is no language, not `""` on the wire.
+        let (_client, _session) = joined_with(
+            &server,
+            JoinConfiguration { language: Some(String::new()), ..Default::default() },
+        )
+        .await;
+
+        let published = published_memberships(&server).await;
+        assert!(published[0].get(MEMBERSHIP_LANGUAGE_FIELD).is_none());
+    }
+
+    /// The change re-publishes the SAME membership with only the language
+    /// moved: expiry, focus, device, intent and the cached `created_ts`
+    /// anchor are untouched (a fresh anchor would move the expiry window),
+    /// and the staged delayed leave is neither replaced nor restaged.
+    #[async_test]
+    async fn test_a_language_change_republishes_everything_else_unchanged() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+        let (_client, session) = joined_with(
+            &server,
+            JoinConfiguration {
+                call_intent: Some(RtcCallIntent::Video),
+                language: Some("uk".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let delay_id_before = delay_id(&session).expect("a delayed leave is staged after join");
+        let anchor = created_ts(&session);
+
+        session.update_language(Some("zh-Hans".to_owned())).await.unwrap();
+
+        let published = published_memberships(&server).await;
+        assert_eq!(published.len(), 2, "one join, one language change");
+        let (joined, changed) = (&published[0], &published[1]);
+        assert_eq!(changed[MEMBERSHIP_LANGUAGE_FIELD], json!("zh-Hans"));
+        assert_eq!(changed["created_ts"], json!(anchor), "the anchor is the cached one");
+        let without = |content: &JsonValue| {
+            let mut content = content.clone();
+            let object = content.as_object_mut().unwrap();
+            object.remove(MEMBERSHIP_LANGUAGE_FIELD);
+            // The join publishes no `created_ts` (peers fall back to the
+            // event's timestamp); every re-publish names the cached anchor,
+            // exactly as an intent change always has.
+            object.remove("created_ts");
+            content
+        };
+        assert_eq!(without(changed), without(joined), "nothing else moved");
+        assert_eq!(changed["m.call.intent"], json!("video"));
+
+        assert_eq!(created_ts(&session), anchor, "the cached anchor is unchanged");
+        assert_eq!(delay_id(&session), Some(delay_id_before), "the delayed leave is kept");
+        let stagings = server
+            .server()
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.query().unwrap_or_default().contains("msc4140.delay"))
+            .count();
+        assert_eq!(stagings, 1, "no second delayed leave was staged");
+    }
+
+    #[async_test]
+    async fn test_the_same_language_again_sends_nothing() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+        let (_client, session) = joined_with(
+            &server,
+            JoinConfiguration { language: Some("uk".to_owned()), ..Default::default() },
+        )
+        .await;
+
+        session.update_language(Some("uk".to_owned())).await.unwrap();
+
+        assert_eq!(published_memberships(&server).await.len(), 1, "only the join");
+    }
+
+    #[async_test]
+    async fn test_clearing_the_language_removes_the_key() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+        let (_client, session) = joined_with(
+            &server,
+            JoinConfiguration { language: Some("uk".to_owned()), ..Default::default() },
+        )
+        .await;
+
+        session.update_language(None).await.unwrap();
+
+        let published = published_memberships(&server).await;
+        assert_eq!(published.len(), 2);
+        assert!(published[1].get(MEMBERSHIP_LANGUAGE_FIELD).is_none());
+    }
+
+    #[async_test]
+    async fn test_a_language_change_needs_a_joined_session() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let room = server.sync_joined_room(&client, room()).await;
+        let session = room.matrix_rtc_session().unwrap();
+
+        let result = session.update_language(Some("uk".to_owned())).await;
+
+        assert!(matches!(result, Err(Error::NotJoined)));
+    }
+
+    /// The other publishers keep the language: an intent change after a
+    /// language change, and the self-heal that re-asserts a wiped
+    /// membership. A publisher that rebuilt the content from its own copy
+    /// would silently drop the person's language mid-call.
+    #[async_test]
+    async fn test_other_republishes_keep_the_language() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+        let _cancel_any = Mock::given(method("POST"))
+            .and(path_regex(r"^/_matrix/client/unstable/org.matrix.msc4140/delayed_events/delay-"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount_as_scoped(server.server())
+            .await;
+        let (_client, session) = joined_with(
+            &server,
+            JoinConfiguration {
+                call_intent: Some(RtcCallIntent::Audio),
+                language: Some("uk".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        session.update_language(Some("en".to_owned())).await.unwrap();
+        session.update_call_intent(RtcCallIntent::Video).await.unwrap();
+        session.republish_membership().await;
+        let (transport, participant) = {
+            let state = session.inner.state.lock().await;
+            let SessionState::Joined(joined) = &*state else { panic!("expected to be joined") };
+            (joined.transport.clone(), joined.participant.clone())
+        };
+        session
+            .refresh_membership_once(
+                &transport,
+                DEFAULT_MEMBERSHIP_EXPIRY,
+                MilliSecondsSinceUnixEpoch::now(),
+                &participant,
+            )
+            .await
+            .unwrap();
+
+        let published = published_memberships(&server).await;
+        assert_eq!(published.len(), 5, "join, language, intent, self-heal, refresh");
+        for (n, content) in published.iter().enumerate().skip(1) {
+            assert_eq!(content[MEMBERSHIP_LANGUAGE_FIELD], json!("en"), "publish #{n}");
+        }
+        for (n, content) in published.iter().enumerate().skip(2) {
+            assert_eq!(content["m.call.intent"], json!("video"), "publish #{n}");
+        }
+    }
+
+    /// Reading: each member's own language reaches the caller, a membership
+    /// forged under somebody else's state key reaches nobody, and a change
+    /// of language alone is a `MembershipsChanged` the caller sees live.
+    #[async_test]
+    async fn test_memberships_carry_each_participants_language() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leaves(&server).await;
+        let (client, session) = joined_with(&server, JoinConfiguration::default()).await;
+        let mut updates = session.subscribe();
+
+        let bob = raw_membership(
+            "@bob:localhost",
+            "_@bob:localhost_BOB_m.call",
+            "BOB",
+            "$bob-1",
+            Some("uk"),
+        );
+        let carol = raw_membership(
+            "@carol:localhost",
+            "_@carol:localhost_CAROL_m.call",
+            "CAROL",
+            "$carol-1",
+            None,
+        );
+        // Mallory writes a membership — and a language — under Dave's key.
+        let forged = raw_membership(
+            "@mallory:localhost",
+            "_@dave:localhost_DAVE_m.call",
+            "DAVE",
+            "$forged-1",
+            Some("en"),
+        );
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room())
+                    .add_state_event(bob)
+                    .add_state_event(carol)
+                    .add_state_event(forged),
+            )
+            .await;
+
+        let languages: Vec<(String, Option<String>)> = session
+            .memberships()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|membership| (membership.user_id.to_string(), membership.language))
+            .collect();
+        assert_eq!(
+            languages,
+            vec![
+                ("@bob:localhost".to_owned(), Some("uk".to_owned())),
+                ("@carol:localhost".to_owned(), None),
+            ],
+            "the forged membership is not a participant, so it has no language either"
+        );
+
+        // Bob changes language: a new event, same device, nothing else.
+        let bob_changed = raw_membership(
+            "@bob:localhost",
+            "_@bob:localhost_BOB_m.call",
+            "BOB",
+            "$bob-2",
+            Some("pt-BR"),
+        );
+        server
+            .sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob_changed))
+            .await;
+        session.synchronise_memberships().await.unwrap();
+
+        let mut latest = None;
+        while let Ok(update) = updates.try_recv() {
+            if let MatrixRtcUpdate::MembershipsChanged { memberships } = update {
+                latest = Some(memberships);
+            }
+        }
+        let latest = latest.expect("the change was announced");
+        let bob = latest
+            .iter()
+            .find(|membership| membership.user_id == "@bob:localhost")
+            .expect("bob is still in the call");
+        assert_eq!(bob.language.as_deref(), Some("pt-BR"));
     }
 }
 
