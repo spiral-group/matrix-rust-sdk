@@ -13,7 +13,8 @@
 // limitations under the License.
 
 // Modified by the Spiral authors, 2026: an event that can't hold a read receipt
-// adds no implicit one for another user, a malformed state event included.
+// adds no implicit one for another user, a malformed state event included; a
+// thread root keeps its bundled summary until its replies are counted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -816,10 +817,19 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             if let Ok(Some(thread_info)) =
                 self.meta.event_cache.thread_info(self.focus.room_id(), event_id).await
             {
-                Some(SdkThreadSummary {
+                let computed = SdkThreadSummary {
                     latest_reply: thread_info.latest_event.clone(),
                     num_replies: thread_info.number_of_replies,
-                })
+                };
+                // A `ThreadInfo` the Event Cache created but never computed
+                // (the thread was opened, or a threaded receipt arrived,
+                // before any of its replies was on this device) knows
+                // nothing yet: the summary bundled with the event stands.
+                if thread_info.summary_computed {
+                    Some(computed)
+                } else {
+                    event.thread_summary().or(Some(computed))
+                }
             }
             // Ah, the thread summary data don't exist in a `ThreadInfo` in the Event Cache.
             // Theoretically, the Event Cache **MUST HAVE** populated the `ThreadInfo`, but, in case

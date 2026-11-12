@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: the tests match ThreadInfo, which has a
+// new field, with `..`.
+
 //! Trait and macro of integration tests for `EventCacheStore` implementations.
 
 use std::{
@@ -1652,7 +1655,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         //
         // We must get an empty `ThreadInfo` because we want to create if if
         // missing.
-        let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } =
+        let ThreadInfo { read_receipts, .. } =
             self.load_thread_info(room_id, thread_id, true).await.unwrap().unwrap();
         let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
             read_receipts;
@@ -1668,7 +1671,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         // create it if missing.
         let mut thread_info =
             self.load_thread_info(room_id, thread_id, false).await.unwrap().unwrap();
-        let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } = &thread_info;
+        let ThreadInfo { read_receipts, .. } = &thread_info;
         let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
             read_receipts;
         assert_eq!(*num_unread, 0);
@@ -1685,7 +1688,7 @@ impl EventCacheStoreIntegrationTests for DynEventCacheStore {
         // Load for the fourth time.
         //
         // We must get the updated `ThreadInfo`.
-        let ThreadInfo { number_of_replies: _, latest_event: _, read_receipts } =
+        let ThreadInfo { read_receipts, .. } =
             self.load_thread_info(room_id, thread_id, true).await.unwrap().unwrap();
         let ReadReceipts { num_unread, num_notifications, num_mentions, latest_active, pending } =
             read_receipts;

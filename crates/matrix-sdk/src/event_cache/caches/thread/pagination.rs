@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a back-pagination that reaches the
+// thread root recounts the replies and announces the summary to the thread and
+// its room.
+
 use std::{fmt, sync::Arc};
 
 use eyeball::SharedObservable;
@@ -33,9 +37,10 @@ use super::{
             BackPaginationOutcome, LoadMoreEventsBackwardsOutcome, PaginatedCache, Pagination,
             SharedPaginationStatus,
         },
-        room::RoomEventCacheGenericUpdate,
+        room::{RoomEventCacheGenericUpdate, RoomEventCacheUpdate},
     },
     ThreadEventCacheInner,
+    state::Recount,
     updates::ThreadEventCacheUpdate,
 };
 use crate::room::{IncludeRelations, RelationsOptions};
@@ -411,6 +416,41 @@ impl PaginatedCache for ThreadEventCacheWrapper {
                 }),
                 Some(RoomEventCacheGenericUpdate { room_id: state.room_id.clone() }),
             );
+        }
+
+        // A back-pagination that reached the thread root has loaded the whole
+        // thread, possibly replies this device never had (an old thread
+        // opened on a new device): recount, and tell the thread and its room
+        // when the summary changed. Sync only recounts a thread it brings new
+        // events for, so nothing else would. A back-pagination that stopped
+        // short has seen only part of the thread: its count would be lower
+        // than the one the server bundled with the root, so it is left alone.
+        if reached_start {
+            let (previous_summary, was_computed) = {
+                let thread_info = state.state.thread_info.read().await;
+                (
+                    (thread_info.number_of_replies, thread_info.latest_event.clone()),
+                    thread_info.summary_computed,
+                )
+            };
+            let thread_summary = state.recount_thread_summary(Recount::WholeThread).await?;
+            // Until now the root showed the summary bundled with it, not the
+            // stored one: an unchanged stored count still changes the screen.
+            if !was_computed
+                || previous_summary
+                    != (thread_summary.num_replies, thread_summary.latest_reply.clone())
+            {
+                state
+                    .update_sender
+                    .send(ThreadEventCacheUpdate::UpdateSummary(thread_summary.clone()), None);
+                self.cache.room_update_sender.send(
+                    RoomEventCacheUpdate::UpdateThreadSummary {
+                        thread_root: state.thread_id.clone(),
+                        thread_summary,
+                    },
+                    Some(RoomEventCacheGenericUpdate { room_id: state.room_id.clone() }),
+                );
+            }
         }
 
         Ok(Some(BackPaginationOutcome { reached_start, events }))

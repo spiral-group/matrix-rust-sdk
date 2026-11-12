@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: tests that a thread root keeps its
+// bundled summary until the thread's replies are counted.
+
 use std::{assert_matches, ops::Not as _, time::Duration};
 
 use eyeball_im::VectorDiff;
@@ -2371,4 +2374,281 @@ async fn test_redaction_affects_thread_summary() {
     assert!(thread_summary.latest_event.is_unavailable());
 
     assert_pending!(stream);
+}
+
+/// The thread summary shown on `root` in `timeline`: replies and the body of
+/// the latest one, if loaded.
+async fn root_thread_summary(
+    timeline: &matrix_sdk_ui::Timeline,
+    root: &ruma::EventId,
+) -> Option<(u32, Option<String>)> {
+    timeline.items().await.iter().find_map(|item| {
+        let event = item.as_event()?;
+        (event.event_id() == Some(root)).then(|| {
+            event.content().thread_summary().map(|summary| {
+                let latest = match &summary.latest_event {
+                    TimelineDetails::Ready(latest) => {
+                        latest.content.as_message().map(|message| message.body().to_owned())
+                    }
+                    _ => None,
+                };
+                (summary.num_replies, latest)
+            })
+        })?
+    })
+}
+
+/// Wait until the summary on `root` is `expected`.
+async fn wait_for_root_thread_summary(
+    timeline: &matrix_sdk_ui::Timeline,
+    root: &ruma::EventId,
+    expected: (u32, Option<&str>),
+) {
+    let expected = (expected.0, expected.1.map(ToOwned::to_owned));
+    let mut last = None;
+    for _ in 0..200 {
+        last = root_thread_summary(timeline, root).await;
+        if last.as_ref() == Some(&expected) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the thread root shows {last:?}, expected {expected:?}");
+}
+
+/// Open the thread of `root` the way a client does: a thread-focused
+/// timeline, which creates the thread's event cache.
+async fn open_thread(room: &matrix_sdk::Room, root: &ruma::EventId) -> matrix_sdk_ui::Timeline {
+    TimelineBuilder::new(room)
+        .with_focus(TimelineFocus::Thread { thread_id: root.to_owned() })
+        .build()
+        .await
+        .unwrap()
+}
+
+/// An old thread opened on a device that has none of its replies: opening it
+/// creates its `ThreadInfo` before anything was counted. That zero must not
+/// hide the summary the server bundled with the root.
+#[async_test]
+async fn test_an_old_thread_opened_without_its_replies_keeps_the_bundled_summary() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("an old thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("the last one!").event_id(event_id!("$latest")).in_thread(root, root).into(),
+        42,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+
+    let _thread = open_thread(&room, root).await;
+    let timeline = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&timeline, root, (42, Some("the last one!"))).await;
+}
+
+/// Back-paginating an opened thread to its root counts its replies: the root
+/// shows the count, not the stale one bundled before the last reply.
+#[async_test]
+async fn test_back_paginating_a_thread_to_its_root_counts_its_replies() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 1").event_id(event_id!("$1")).in_thread(root, root).into(),
+        1,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (1, Some("reply 1"))).await;
+
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default().events(vec![
+            f.text_msg("reply 2")
+                .event_id(event_id!("$2"))
+                .in_thread(root, event_id!("$1"))
+                .into_raw(),
+            f.text_msg("reply 1").event_id(event_id!("$1")).in_thread(root, root).into_raw(),
+        ]))
+        .mock_once()
+        .mount()
+        .await;
+    let thread = open_thread(&room, root).await;
+    assert!(thread.paginate_backwards(20).await.unwrap(), "the whole thread is loaded");
+
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+}
+
+/// A back-pagination that stops short of the root has seen only part of the
+/// thread: its count would be lower than the bundled one, so the root keeps
+/// the bundled summary.
+#[async_test]
+async fn test_a_partial_thread_back_pagination_keeps_the_larger_bundled_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("an old thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 41").event_id(event_id!("$41")).in_thread(root, event_id!("$40")).into(),
+        42,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (42, Some("reply 41"))).await;
+
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default()
+            .events(vec![
+                f.text_msg("reply 42")
+                    .event_id(event_id!("$42"))
+                    .in_thread(root, event_id!("$41"))
+                    .into_raw(),
+                f.text_msg("reply 41")
+                    .event_id(event_id!("$41"))
+                    .in_thread(root, event_id!("$40"))
+                    .into_raw(),
+            ])
+            .next_batch("more"))
+        .mock_once()
+        .mount()
+        .await;
+    let thread = open_thread(&room, root).await;
+    assert!(!thread.paginate_backwards(2).await.unwrap(), "more of the thread is left");
+    sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(root_thread_summary(&timeline, root).await, Some((42, Some("reply 41".to_owned()))));
+}
+
+/// A thread that is really empty — opened, nothing in it, no bundled
+/// summary — still reads zero replies, before and after paginating it.
+#[async_test]
+async fn test_an_empty_thread_reads_zero_replies() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("not a thread yet").event_id(root)),
+        )
+        .await;
+    let thread = open_thread(&room, root).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (0, None)).await;
+
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default())
+        .mock_once()
+        .mount()
+        .await;
+    assert!(thread.paginate_backwards(20).await.unwrap());
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(root_thread_summary(&timeline, root).await, Some((0, None)));
+}
+
+/// Clearing the event cache forgets the replies a thread's count was
+/// computed from, but keeps its `ThreadInfo`: the zero left behind is not a
+/// count, and the bundled summary received again shows.
+#[async_test]
+async fn test_a_cleared_event_cache_does_not_hide_a_bundled_summary() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // A reply syncs into an opened thread: the summary is computed.
+    let _thread = open_thread(&room, root).await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("a thread").event_id(root))
+                .add_timeline_event(
+                    f.text_msg("reply 1").event_id(event_id!("$1")).in_thread(root, root),
+                ),
+        )
+        .await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert!(thread_info.summary_computed);
+    assert_eq!(thread_info.number_of_replies, 1);
+
+    // Everything is forgotten (an ignored user, a cache clear).
+    client.event_cache().unwrap().clear_all_rooms().await.unwrap();
+
+    // The root comes back with the server's summary. (Its latest event is
+    // bundled without a thread relation so that the event cache, which
+    // stores it, does not count it as a reply: the open thread would
+    // otherwise recount from it, which is not what this test is about.)
+    let timeline = room.timeline().await.unwrap();
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 7").event_id(event_id!("$7")).into(),
+        7,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+
+    wait_for_root_thread_summary(&timeline, root, (7, Some("reply 7"))).await;
+}
+
+/// A back-pagination to the root that finds the stored count unchanged still
+/// replaces the bundled summary the root was showing: here the server's
+/// summary is stale, and every reply has since gone.
+#[async_test]
+async fn test_a_whole_thread_pagination_replaces_a_stale_bundled_summary() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // The server says two replies, but the thread has none left (its
+    // bundled latest event carries no thread relation, so it is no reply).
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 1").event_id(event_id!("$1")).into(),
+        2,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let thread = open_thread(&room, root).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 1"))).await;
+
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default())
+        .mock_once()
+        .mount()
+        .await;
+    assert!(thread.paginate_backwards(20).await.unwrap(), "the whole thread is loaded");
+
+    wait_for_root_thread_summary(&timeline, root, (0, None)).await;
 }

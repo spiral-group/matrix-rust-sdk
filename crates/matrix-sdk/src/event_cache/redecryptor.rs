@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a redecryption recount announces a
+// thread summary only once it is computed.
+
 //! The Redecryptor (affectionately known as R2D2) is a layer and long-running
 //! background task which handles redecryption of events in case we couldn't
 //! decrypt them immediately.
@@ -571,9 +574,9 @@ impl EventCacheInner {
             // Filter out results that are `None`, i.e. a thread where no UTD has been replaced.
             .flatten()
             {
-                let new_thread_summary = thread_cache.update_thread_summary().await?;
-
-                all_caches.room.update_thread_summary(&thread_id, new_thread_summary)?;
+                if let Some(new_thread_summary) = thread_cache.update_thread_summary().await? {
+                    all_caches.room.update_thread_summary(&thread_id, new_thread_summary)?;
+                }
             }
         }
 

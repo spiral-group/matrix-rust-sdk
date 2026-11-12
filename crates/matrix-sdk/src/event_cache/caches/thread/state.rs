@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a recount says what it is worth
+// (Recount) and sets ThreadInfo::summary_computed together with the count.
+
 use std::iter::empty;
 
 use eyeball::{AsyncLock, ObservableWriteGuard, SharedObservable};
@@ -108,6 +111,21 @@ pub struct ThreadEventCacheState {
 
     /// A handle for subscribers.
     subscribers_handle: SubscribersHandle,
+}
+
+/// What a recount of a thread's replies is worth, for
+/// [`ThreadInfo::summary_computed`].
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Recount {
+    /// The replies on this device: a count once it finds any, and a
+    /// computed summary stays computed.
+    Local,
+    /// The whole thread is loaded (a back-pagination reached the root): even
+    /// zero is a count.
+    WholeThread,
+    /// The events were forgotten: only replies found from now on make a
+    /// count.
+    FromScratch,
 }
 
 impl ThreadEventCacheState {
@@ -381,7 +399,15 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         self.state.shrink_to_last_reloaded_chunk(&self.store).await?;
 
-        let thread_summary = self.update_thread_summary().await?;
+        // Forgetting every event forgets what the count was computed from: a
+        // zero now is not a count until replies are back (the stored
+        // `ThreadInfo` survives a cleared store, and a computed zero would
+        // hide every bundled summary received again).
+        let recount = match preprocessing {
+            ReloadPreprocessing::ForgetAll => Recount::FromScratch,
+            ReloadPreprocessing::None => Recount::Local,
+        };
+        let thread_summary = self.recount_thread_summary(recount).await?;
 
         Ok((self.thread_linked_chunk_mut().updates_as_vector_diffs(), thread_summary))
     }
@@ -539,6 +565,16 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
     /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
     pub(super) async fn update_thread_summary(&mut self) -> Result<ThreadSummary> {
+        self.recount_thread_summary(Recount::Local).await
+    }
+
+    /// Recount the [`ThreadSummary`] for this thread, store it in one
+    /// [`ThreadInfo`] write together with what the count is worth (see
+    /// [`Recount`]), and return a copy of it.
+    pub(super) async fn recount_thread_summary(
+        &mut self,
+        recount: Recount,
+    ) -> Result<ThreadSummary> {
         // Read the latest number of thread replies from the store.
         //
         // Implementation note: since this is based on the `m.relates_to`
@@ -616,9 +652,20 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         let thread_summary = ThreadSummary::new(latest_event_id, num_replies);
 
+        // A zero from nothing on this device is not a count (see
+        // `ThreadInfo::summary_computed`): an old thread opened before any of
+        // its replies is here must keep its bundled summary. Once computed,
+        // a zero is real (every reply redacted, say).
+        let counted = thread_summary.num_replies > 0;
+
         self.update_thread_info(|thread_info| {
             thread_info.latest_event = thread_summary.latest_reply.clone();
             thread_info.number_of_replies = thread_summary.num_replies;
+            thread_info.summary_computed = match recount {
+                Recount::Local => thread_info.summary_computed || counted,
+                Recount::WholeThread => true,
+                Recount::FromScratch => counted,
+            };
         })
         .await?;
 

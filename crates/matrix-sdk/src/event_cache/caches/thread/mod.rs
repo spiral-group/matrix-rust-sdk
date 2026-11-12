@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: the thread cache holds its room's
+// update sender, and update_thread_summary returns nothing while the summary is
+// not computed.
+
 //! Threads-related data structures.
 
 pub mod pagination;
@@ -46,7 +50,9 @@ use super::{
     },
     EventsOrigin, TimelineVectorDiffs,
     read_receipts::MaybeReceiptEventContent,
-    room::{RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate},
+    room::{
+        RoomEventCacheGenericUpdate, RoomEventCacheLinkedChunkUpdate, RoomEventCacheUpdateSender,
+    },
     subscriber::{AutoShrinkMessage, Subscriber},
 };
 use crate::room::WeakRoom;
@@ -84,6 +90,10 @@ struct ThreadEventCacheInner {
 
     /// Update sender for this thread.
     update_sender: ThreadEventCacheUpdateSender,
+
+    /// Update sender of the room this thread belongs to, for a change of the
+    /// thread summary the thread finds out on its own (a back-pagination).
+    room_update_sender: RoomEventCacheUpdateSender,
 }
 
 impl fmt::Debug for ThreadEventCache {
@@ -103,9 +113,10 @@ impl ThreadEventCache {
         weak_room: WeakRoom,
         state: &StateLock,
         auto_shrink_sender: mpsc::Sender<AutoShrinkMessage>,
-        generic_update_sender: Sender<RoomEventCacheGenericUpdate>,
+        room_update_sender: RoomEventCacheUpdateSender,
         linked_chunk_update_sender: Sender<RoomEventCacheLinkedChunkUpdate>,
     ) -> Result<Self> {
+        let generic_update_sender = room_update_sender.generic_update_sender().clone();
         let update_sender = ThreadEventCacheUpdateSender::new(generic_update_sender.clone());
 
         // Computed while building the state: nothing may await once the state
@@ -146,6 +157,7 @@ impl ThreadEventCache {
                 pagination_batch_token_notifier: Notify::new(),
                 auto_shrink_sender,
                 update_sender,
+                room_update_sender,
             }),
         };
 
@@ -305,17 +317,26 @@ impl ThreadEventCache {
         Ok(())
     }
 
-    /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
-    pub(in super::super) async fn update_thread_summary(&self) -> Result<ThreadSummary> {
+    /// Update the [`ThreadSummary`] for this thread, and return a copy of it
+    /// if it says something about the thread.
+    ///
+    /// `None` while the summary is not computed (see
+    /// `ThreadInfo::summary_computed`): no reply is on this device yet, and
+    /// its zero must not replace the summary bundled with the thread root,
+    /// so nothing is announced.
+    pub(in super::super) async fn update_thread_summary(&self) -> Result<Option<ThreadSummary>> {
         let mut state = self.inner.state.write().await?;
 
         let thread_summary = state.update_thread_summary().await?;
+        if !state.state.thread_info.read().await.summary_computed {
+            return Ok(None);
+        }
 
         state
             .update_sender
             .send(ThreadEventCacheUpdate::UpdateSummary(thread_summary.clone()), None);
 
-        Ok(thread_summary)
+        Ok(Some(thread_summary))
     }
 
     /// Find a single event in this thread.

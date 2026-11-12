@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a thread cache gets its room's update
+// sender, and a thread summary that is not computed yet is not announced.
+
 use std::{collections::HashMap, ops::Not, sync::Arc};
 
 use eyeball::SharedObservable;
@@ -219,7 +222,7 @@ impl Caches {
                         room.weak_room().to_owned(),
                         &self.internals.state,
                         self.internals.auto_shrink_sender.clone(),
-                        room.update_sender().generic_update_sender().clone(),
+                        room.update_sender().clone(),
                         self.internals.linked_chunk_update_sender.clone(),
                     )
                     .await?;
@@ -377,9 +380,9 @@ impl Caches {
                 let thread = self.thread(thread_id).await?;
                 thread.handle_joined_room_update(timeline, read_receipts).await?;
 
-                if update_thread_summary {
-                    let new_thread_summary = thread.update_thread_summary().await?;
-
+                if update_thread_summary
+                    && let Some(new_thread_summary) = thread.update_thread_summary().await?
+                {
                     room.update_thread_summary(thread.thread_id(), new_thread_summary)?;
                 }
             }
