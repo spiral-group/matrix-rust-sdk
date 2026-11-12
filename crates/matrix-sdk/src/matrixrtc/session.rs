@@ -20,17 +20,24 @@ use std::{
     time::Duration,
 };
 
-use matrix_sdk_base::deserialized_responses::RawAnySyncOrStrippedState;
+use matrix_sdk_base::deserialized_responses::{RawAnySyncOrStrippedState, RawSyncOrStrippedState};
 use matrix_sdk_common::executor::{JoinHandle, spawn};
 use ruma::{
-    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedUserId,
-    api::client::delayed_events::{
-        DelayParameters, delayed_state_event,
-        update_delayed_event::{self, UpdateAction},
+    MilliSecondsSinceUnixEpoch, OwnedDeviceId, OwnedEventId, OwnedUserId, UserId,
+    api::{
+        client::{
+            delayed_events::{
+                DelayParameters, delayed_state_event,
+                update_delayed_event::{self, UpdateAction},
+            },
+            state::get_state_event_for_key,
+        },
+        error::ErrorKind,
     },
     events::{
         AnyToDeviceEvent, Mentions, StateEventType,
         relation::Reference,
+        room::member::{MembershipState, RoomMemberEventContent},
         rtc::notification::{CallIntent, NotificationType, RtcNotificationEventContent},
     },
     serde::Raw,
@@ -52,7 +59,7 @@ use super::{
     },
     transport::{LiveKitTransport, TransportCredentials},
 };
-use crate::{Room, event_handler::EventHandlerDropGuard};
+use crate::{Room, RoomState, config::RequestConfig, event_handler::EventHandlerDropGuard};
 
 /// How long a freshly created key stays valid for a joining participant before
 /// we rotate instead of re-sharing. Mirrors Element Call's grace period.
@@ -83,6 +90,21 @@ const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(10);
 /// room a peer whose device keys landed a moment late stayed silent until
 /// somebody sent a message or a receipt (pre-merge review 2026-09-08, SDK P2).
 const OWED_KEY_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long one look-up of a call member's room membership may take. A
+/// look-up is one small state request, and `memberships()` waits for it.
+const MEMBER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the membership observer waits before looking a call member up
+/// again after a failed look-up, doubling up to the maximum while the
+/// failures last.
+const MEMBER_LOOKUP_RETRY_MIN: Duration = Duration::from_secs(2);
+const MEMBER_LOOKUP_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How long a failed reload of the member list waits before the next try,
+/// doubling up to the maximum.
+const MEMBER_LIST_RELOAD_RETRY_MIN: Duration = Duration::from_secs(2);
+const MEMBER_LIST_RELOAD_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// How long receivers should consider an outgoing call notification valid.
 const NOTIFICATION_LIFETIME: Duration = Duration::from_secs(30);
@@ -247,6 +269,12 @@ struct SessionInner {
     /// homeserver request, so two of them cannot interleave and publish a
     /// stale copy of the other's field.
     membership_update: Mutex<()>,
+    /// The room membership of call members the state store has no
+    /// `m.room.member` event for (a lazy-loaded member list), looked up on
+    /// the homeserver one user at a time: joined or not. The store wins
+    /// whenever it has an event, so a later kick or leave from sync
+    /// overrides what was looked up.
+    looked_up_members: std::sync::Mutex<BTreeMap<OwnedUserId, bool>>,
     updates: broadcast::Sender<MatrixRtcUpdate>,
 }
 
@@ -348,6 +376,7 @@ impl MatrixRtcSession {
             inner: Arc::new(SessionInner {
                 reconcile: Mutex::new(()),
                 membership_update: Mutex::new(()),
+                looked_up_members: Default::default(),
                 user_id,
                 device_id,
                 state: Mutex::new(SessionState::Idle),
@@ -409,9 +438,31 @@ impl MatrixRtcSession {
         }
     }
 
-    /// The memberships currently published in the room, ours included.
+    /// The memberships currently published in the room by its joined
+    /// members, ours included.
+    ///
+    /// A membership counts only while its sender is joined to the room: a
+    /// user who left, was kicked or was banned is not in the call, although
+    /// their call membership stays in the room's state until it expires.
+    ///
+    /// A call member whose room membership the store does not hold (a
+    /// lazy-loaded member list) is looked up on the homeserver first, each
+    /// look-up bounded by a few seconds. If one still cannot be told, this
+    /// fails with [`Error::UnknownCallMembers`] rather than answer with a
+    /// call that may be missing them.
     pub async fn memberships(&self) -> Result<Vec<RtcMembership>> {
-        read_memberships(&self.room).await
+        let reading = self.read_call().await?;
+        if reading.unknown_senders.is_empty() {
+            return Ok(reading.memberships);
+        }
+
+        self.look_up_members(&reading.unknown_senders).await;
+
+        let reading = self.read_call().await?;
+        if !reading.unknown_senders.is_empty() {
+            return Err(Error::UnknownCallMembers(reading.unknown_senders.len()));
+        }
+        Ok(reading.memberships)
     }
 
     /// Join the session.
@@ -499,6 +550,14 @@ impl MatrixRtcSession {
         }
 
         info!("Joined the MatrixRTC session");
+
+        // Call members the store cannot place in the room are looked up
+        // first, so the first participant list and the first key include
+        // them; the membership observer retries the ones that fail.
+        let reading = self.read_call().await?;
+        if !reading.unknown_senders.is_empty() {
+            self.look_up_members(&reading.unknown_senders).await;
+        }
 
         // Distribute the first key to everybody already in the call.
         self.synchronise_memberships().await?;
@@ -866,12 +925,45 @@ impl MatrixRtcSession {
 
         spawn(async move {
             let mut subscriber = room.subscribe_info();
+            let mut look_ups = MemberLookups::new();
+            let mut member_list = MemberListReload::default();
+            member_list.reload_if_missing(&room);
 
-            while subscriber.next().await.is_some() {
+            loop {
+                // Every sync that touches the room updates its info, a kick
+                // or a leave among them: a participant removed from the room
+                // leaves the call here even though their call membership
+                // stays. A look-up that failed is retried on a timer while it
+                // keeps failing, in a quiet room too: nothing else would
+                // bring that participant the key.
+                let room_changed = match look_ups.retry_delay() {
+                    None => match subscriber.next().await {
+                        Some(_) => true,
+                        None => break,
+                    },
+                    Some(delay) => tokio::select! {
+                        changed = subscriber.next() => match changed {
+                            Some(_) => true,
+                            None => break,
+                        },
+                        () = matrix_sdk_common::sleep::sleep(delay) => false,
+                    },
+                };
+
                 let Some(session) = session.upgrade() else { break };
 
-                if let Err(error) = session.synchronise_memberships().await {
+                member_list.reload_if_missing(&room);
+                if room_changed && let Err(error) = session.synchronise_memberships().await {
                     warn!("Could not process a MatrixRTC membership change: {error}");
+                }
+
+                // Call members the store cannot place in the room: look them
+                // up, and once one is known reconcile again, so a joined one
+                // gets the key without waiting for the room to change.
+                if session.look_up_unknown_members(&mut look_ups).await
+                    && let Err(error) = session.synchronise_memberships().await
+                {
+                    warn!("Could not process a looked-up MatrixRTC membership: {error}");
                 }
             }
         })
@@ -1170,7 +1262,7 @@ impl MatrixRtcSession {
         // One reconciliation at a time (see `SessionInner::reconcile`).
         let _reconcile = self.inner.reconcile.lock().await;
 
-        let memberships = read_memberships(&self.room).await?;
+        let memberships = self.read_call().await?.memberships;
 
         let mut state = self.inner.state.lock().await;
         let SessionState::Joined(joined) = &mut *state else {
@@ -1555,6 +1647,18 @@ struct ToDeviceEnvelope {
     content: Box<RawJsonValue>,
 }
 
+/// The part of an `m.room.member` event [`stored_membership`] reads; a
+/// redacted one keeps it.
+#[derive(Deserialize)]
+struct MemberEventEnvelope {
+    content: MemberContentEnvelope,
+}
+
+#[derive(Deserialize)]
+struct MemberContentEnvelope {
+    membership: MembershipState,
+}
+
 #[derive(Deserialize)]
 struct StateEventEnvelope {
     state_key: String,
@@ -1600,7 +1704,7 @@ struct VerifiedUserProblem {
 }
 
 impl VerifiedUserProblem {
-    fn covers(&self, user_id: &ruma::UserId, device_id: &ruma::DeviceId) -> bool {
+    fn covers(&self, user_id: &UserId, device_id: &ruma::DeviceId) -> bool {
         self.users.contains(user_id)
             || self.devices.contains(&(user_id.to_owned(), device_id.to_owned()))
     }
@@ -1655,8 +1759,253 @@ fn recipients_of_an_unrotated_round(
         .collect()
 }
 
-/// Read every non-expired membership published in the room.
-async fn read_memberships(room: &Room) -> Result<Vec<RtcMembership>> {
+/// Reloads the room's member list in the background when the store stops
+/// holding all of it.
+///
+/// A limited sync (a gap in the timeline: the phone was offline while events
+/// piled up) marks the member list missing, and with a lazy-loaded member
+/// list a kick inside the gap may never reach the store: the store keeps
+/// saying "joined", and that user would get every new key for the rest of
+/// the call. Reloading the list heals it — a member list answered after a
+/// newer sync cannot undo that sync (`Room::start_member_list_request`) —
+/// and the room info it updates wakes the observer to reconcile.
+///
+/// Never awaited on the key path. One reload at a time, started whenever the
+/// list is missing and no reload is in flight: when a gap marks it missing,
+/// and when the observer starts with it missing. A reload ends only once the
+/// list has loaded — a failing one retries on its own with a backoff — so a
+/// finished reload and a missing list mean a new gap, never a storm: every
+/// reload started is one that is needed. Dropped with the observer, which
+/// aborts it.
+#[derive(Debug, Default)]
+struct MemberListReload {
+    task: Option<JoinHandle<()>>,
+}
+
+impl MemberListReload {
+    fn reload_if_missing(&mut self, room: &Room) {
+        // Only a joined room has a member list to load (`sync_members` does
+        // nothing otherwise, and a reload that cannot load must not restart
+        // on every wake).
+        if room.are_members_synced() || room.state() != RoomState::Joined {
+            return;
+        }
+        if self.task.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+
+        let room = room.clone();
+        self.task = Some(spawn(async move {
+            let mut delay = MEMBER_LIST_RELOAD_RETRY_MIN;
+            loop {
+                match room.sync_members().await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        warn!("Could not reload the member list for the call; retrying: {error}");
+                    }
+                }
+                matrix_sdk_common::sleep::sleep(delay).await;
+                delay = (delay * 2).min(MEMBER_LIST_RELOAD_RETRY_MAX);
+            }
+        }));
+    }
+}
+
+impl Drop for MemberListReload {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+}
+
+/// The observer's look-ups of call members the store cannot place in the
+/// room: who failed, and when to try them again.
+#[derive(Debug)]
+struct MemberLookups {
+    /// Looked up and still not known.
+    failing: BTreeSet<OwnedUserId>,
+    /// When to look the unknown members up again, if anything is pending.
+    next_retry: Option<std::time::Instant>,
+    /// The wait before `next_retry`, doubled per failed round.
+    delay: Duration,
+}
+
+impl MemberLookups {
+    /// Armed for one round shortly after the observer starts: a look-up
+    /// `join` made that failed is retried even if the room stays quiet.
+    fn new() -> Self {
+        Self {
+            failing: BTreeSet::new(),
+            next_retry: Some(std::time::Instant::now() + MEMBER_LOOKUP_RETRY_MIN),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// How long until the next round is due, if one is pending.
+    fn retry_delay(&self) -> Option<Duration> {
+        self.next_retry.map(|at| at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Who to look up among the call members not known now: the ones never
+    /// tried, and every one of them once a retry is due (which consumes it).
+    fn due(&mut self, unknown: &BTreeSet<OwnedUserId>) -> BTreeSet<OwnedUserId> {
+        // Known by now (sync, a look-up) or out of the call: no more retries.
+        self.failing.retain(|user_id| unknown.contains(user_id));
+        let retry_due = self.next_retry.is_some_and(|at| at <= std::time::Instant::now());
+        if retry_due {
+            self.next_retry = None;
+        }
+        unknown
+            .iter()
+            .filter(|user_id| retry_due || !self.failing.contains(*user_id))
+            .cloned()
+            .collect()
+    }
+
+    /// Record a round's outcome, and schedule the next round while anybody
+    /// is still not known, backing off up to [`MEMBER_LOOKUP_RETRY_MAX`].
+    fn record(&mut self, looked_up: &BTreeSet<OwnedUserId>, still_unknown: BTreeSet<OwnedUserId>) {
+        self.failing.retain(|user_id| !looked_up.contains(user_id));
+        self.failing.extend(still_unknown);
+
+        if self.failing.is_empty() {
+            self.next_retry = None;
+            self.delay = Duration::ZERO;
+        } else if self.next_retry.is_none() {
+            self.delay = if self.delay.is_zero() {
+                MEMBER_LOOKUP_RETRY_MIN
+            } else {
+                (self.delay * 2).min(MEMBER_LOOKUP_RETRY_MAX)
+            };
+            self.next_retry = Some(std::time::Instant::now() + self.delay);
+        }
+    }
+}
+
+/// A reading of the call: the memberships of joined members, and the
+/// senders of memberships whose room membership is not known.
+struct CallReading {
+    memberships: Vec<RtcMembership>,
+    unknown_senders: BTreeSet<OwnedUserId>,
+}
+
+impl MatrixRtcSession {
+    /// Read the call; see [`read_call`].
+    async fn read_call(&self) -> Result<CallReading> {
+        read_call(&self.room, &self.inner.looked_up_members).await
+    }
+
+    /// Look the room membership of `user_ids` up on the homeserver, one
+    /// state request each, all at once, each bounded by
+    /// [`MEMBER_LOOKUP_TIMEOUT`]. What is learnt is kept for [`read_call`];
+    /// a failed look-up leaves the user unknown.
+    async fn look_up_members(&self, user_ids: &BTreeSet<OwnedUserId>) {
+        let results = futures_util::future::join_all(
+            user_ids.iter().map(|user_id| look_up_membership(&self.room, user_id)),
+        )
+        .await;
+
+        let mut looked_up = self.inner.looked_up_members.lock().unwrap();
+        for (user_id, joined) in user_ids.iter().zip(results) {
+            if let Some(joined) = joined {
+                looked_up.insert(user_id.clone(), joined);
+            }
+        }
+    }
+
+    /// The observer's round of look-ups (see [`MemberLookups`]). Returns
+    /// whether anybody's membership became known.
+    async fn look_up_unknown_members(&self, look_ups: &mut MemberLookups) -> bool {
+        let unknown = match self.read_call().await {
+            Ok(reading) => reading.unknown_senders,
+            Err(error) => {
+                warn!("Could not read the call to look its members up: {error}");
+                return false;
+            }
+        };
+
+        let due = look_ups.due(&unknown);
+        if due.is_empty() {
+            return false;
+        }
+
+        self.look_up_members(&due).await;
+
+        let still_unknown: BTreeSet<OwnedUserId> = {
+            let looked_up = self.inner.looked_up_members.lock().unwrap();
+            due.iter().filter(|user_id| !looked_up.contains_key(*user_id)).cloned().collect()
+        };
+        let anybody_known = still_unknown.len() < due.len();
+        if !still_unknown.is_empty() {
+            warn!(
+                count = still_unknown.len(),
+                "Could not look up the room membership of some call members; retrying"
+            );
+        }
+        look_ups.record(&due, still_unknown);
+
+        anybody_known
+    }
+}
+
+/// The room membership of `user_id`, from the homeserver: `Some(true)` when
+/// joined, `Some(false)` when not (no member event at all included), `None`
+/// when the look-up failed.
+async fn look_up_membership(room: &Room, user_id: &UserId) -> Option<bool> {
+    let request = get_state_event_for_key::v3::Request::new(
+        room.room_id().to_owned(),
+        StateEventType::RoomMember,
+        user_id.to_string(),
+    );
+    let config = RequestConfig::new().timeout(MEMBER_LOOKUP_TIMEOUT).disable_retry();
+
+    match room.client().send(request).with_request_config(config).await {
+        Ok(response) => {
+            match response.into_content().deserialize_as_unchecked::<MemberContentEnvelope>() {
+                Ok(content) => Some(content.membership == MembershipState::Join),
+                Err(error) => {
+                    warn!(%user_id, "A call member's looked-up membership is malformed: {error}");
+                    None
+                }
+            }
+        }
+        Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => Some(false),
+        Err(error) => {
+            debug!(%user_id, "Could not look up a call member's room membership: {error}");
+            None
+        }
+    }
+}
+
+/// Read every non-expired membership published in the room, keeping only
+/// those of joined members.
+///
+/// This is the one reading of the call: [`MatrixRtcSession::memberships`],
+/// every [`MatrixRtcUpdate::MembershipsChanged`] and the recipients of every
+/// media key go through it.
+///
+/// Only a joined member of the room is in its call. A call membership is a
+/// state event only its sender can clear, and a user who left, was kicked or
+/// was banned can no longer send one: their last membership stays in the
+/// room's state until it expires, hours later. Counted, it kept a removed
+/// participant in the call, sent them every new media key, and — nobody
+/// having left — never rotated the key away from them. Left out, a removal
+/// is a departure like any other, and rotates.
+///
+/// A sender's membership comes from the state store; when the store has no
+/// `m.room.member` event for them (a lazy-loaded member list), from what was
+/// looked up on the homeserver (`looked_up`). Failing both, the sender is
+/// UNKNOWN: left out — an unknown user never gets the call's key on a guess
+/// — and returned in [`CallReading::unknown_senders`] to be looked up.
+///
+/// Our own membership is exempt: whether we are still in the room is the
+/// room's own state, and leaving our membership out would read as a wiped
+/// membership and re-publish it into the server's refusal.
+async fn read_call(
+    room: &Room,
+    looked_up: &std::sync::Mutex<BTreeMap<OwnedUserId, bool>>,
+) -> Result<CallReading> {
     let events = room
         .get_state_events(StateEventType::from(CALL_MEMBER_EVENT_TYPE))
         .await
@@ -1684,9 +2033,62 @@ async fn read_memberships(room: &Room) -> Result<Vec<RtcMembership>> {
         ));
     }
 
+    let own_user_id = room.own_user_id();
+    let mut joined = BTreeMap::<OwnedUserId, Option<bool>>::new();
+    for membership in &memberships {
+        if membership.user_id == own_user_id || joined.contains_key(&membership.user_id) {
+            continue;
+        }
+        let stored = stored_membership(room, &membership.user_id).await?;
+        let is_joined =
+            stored.or_else(|| looked_up.lock().unwrap().get(&membership.user_id).copied());
+        joined.insert(membership.user_id.clone(), is_joined);
+    }
+
+    let unknown_senders: BTreeSet<OwnedUserId> = joined
+        .iter()
+        .filter(|(_, is_joined)| is_joined.is_none())
+        .map(|(user_id, _)| user_id.clone())
+        .collect();
+    let left_out = joined.values().filter(|is_joined| **is_joined != Some(true)).count();
+    if left_out > 0 {
+        debug!(
+            left_out,
+            unknown = unknown_senders.len(),
+            "Leaving call members not known to be joined to the room out of the call"
+        );
+    }
+
+    let mut memberships: Vec<RtcMembership> = memberships
+        .into_iter()
+        .filter(|membership| {
+            membership.user_id == own_user_id
+                || joined.get(&membership.user_id) == Some(&Some(true))
+        })
+        .collect();
     memberships.sort_by_key(|membership| membership.livekit_identity());
 
-    Ok(memberships)
+    Ok(CallReading { memberships, unknown_senders })
+}
+
+/// Whether the state store holds `user_id` as a joined member of the room;
+/// `None` when it has no `m.room.member` event for them.
+async fn stored_membership(room: &Room, user_id: &UserId) -> Result<Option<bool>> {
+    let event = room
+        .get_state_event_static_for_key::<RoomMemberEventContent, _>(user_id)
+        .await
+        .map_err(Error::from_sdk)?;
+
+    let json = match &event {
+        Some(RawSyncOrStrippedState::Sync(raw)) => raw.json(),
+        Some(RawSyncOrStrippedState::Stripped(raw)) => raw.json(),
+        None => return Ok(None),
+    };
+
+    Ok(Some(
+        serde_json::from_str::<MemberEventEnvelope>(json.get())
+            .is_ok_and(|event| event.content.membership == MembershipState::Join),
+    ))
 }
 
 impl Room {
@@ -2521,6 +2923,13 @@ mod reconciliation_tests {
             .event_id(event_id)
     }
 
+    /// Bob's `m.room.member` join: only a joined member is in the call.
+    fn bob_joined(
+        f: &EventFactory,
+    ) -> matrix_sdk_test::event_factory::EventBuilder<RoomMemberEventContent> {
+        f.member(owned_user_id!("@bob:localhost"))
+    }
+
     fn unshared(session: &MatrixRtcSession) -> BTreeSet<String> {
         let state = session.inner.state.try_lock().expect("state is not held across awaits");
         match &*state {
@@ -2548,7 +2957,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
 
         let first = known(&session);
@@ -2594,7 +3008,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
         assert!(unshared(&session).contains("@bob:localhost:BOB"));
 
@@ -2651,7 +3070,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
         assert_eq!(known(&session).len(), 1, "bob is in the roster");
         assert!(unshared(&session).contains("@bob:localhost:BOB"), "but still owed the key");
@@ -2694,7 +3118,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
         let first_ts = known(&session)["@bob:localhost:BOB"];
 
@@ -2753,7 +3182,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
         assert_eq!(known(&session).len(), 1);
 
@@ -2786,6 +3220,510 @@ mod reconciliation_tests {
         );
     }
 
+    fn bob_id() -> OwnedUserId {
+        owned_user_id!("@bob:localhost")
+    }
+
+    /// Answers the per-user look-up of Bob's room membership
+    /// (`GET /rooms/{id}/state/m.room.member/@bob:localhost`).
+    fn bob_lookup() -> wiremock::MockBuilder {
+        Mock::given(method("GET"))
+            .and(path_regex(r"/rooms/.*/state/m\.room\.member/(%40|@)bob(%3A|:)localhost$"))
+    }
+
+    /// Wait for the next participant list, and return it.
+    async fn next_roster(updates: &mut broadcast::Receiver<MatrixRtcUpdate>) -> Vec<RtcMembership> {
+        loop {
+            if let MatrixRtcUpdate::MembershipsChanged { memberships } =
+                updates.recv().await.expect("the session is alive")
+            {
+                return memberships;
+            }
+        }
+    }
+
+    /// Wait until a participant list includes `user_id`.
+    async fn roster_with(updates: &mut broadcast::Receiver<MatrixRtcUpdate>, user_id: &UserId) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !next_roster(updates).await.iter().any(|m| m.user_id == user_id) {}
+        })
+        .await
+        .expect("the participant joins the roster");
+    }
+
+    /// A participant removed from the room is out of the call. Their call
+    /// membership stays in the room's state — only its sender can clear it,
+    /// and the server refuses a user who is no longer in the room — so it
+    /// kept them in the call for its whole expiry, sent them every new key,
+    /// and, nobody having left, never rotated away from them. The removal
+    /// alone, with no call-member event, takes them out and rotates.
+    async fn assert_a_removal_rotates_the_key_away(
+        removal: impl Into<Raw<ruma::events::AnySyncStateEvent>>,
+    ) {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let (client, _room, session) = joined_session(&server).await;
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
+        session.synchronise_memberships().await.unwrap();
+        assert_eq!(known(&session).len(), 1, "bob is in the call");
+
+        let mut updates = session.subscribe();
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(removal)).await;
+
+        // No reconciliation by hand: the membership observer sees the
+        // removal as a change of the room.
+        let mut roster = None;
+        let rotated_to = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match updates.recv().await.expect("the session is alive") {
+                    MatrixRtcUpdate::MembershipsChanged { memberships } => {
+                        roster = Some(memberships);
+                    }
+                    MatrixRtcUpdate::OwnEncryptionKeyChanged { key } => break key.index,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("a removal rotates the key");
+
+        let roster = roster.expect("the participant list changes before the key does");
+        assert!(
+            roster.iter().all(|membership| membership.user_id != bob_id()),
+            "the removed user is out of the participant list"
+        );
+        assert_eq!(rotated_to, 1, "the removal rotates our key to the next ring index");
+        assert!(known(&session).is_empty(), "bob is forgotten");
+        // A recipient this mock server cannot reach (no device keys) would be
+        // owed the key: bob is not, because the rotated key never went to him.
+        assert!(!unshared(&session).contains("@bob:localhost:BOB"), "the new key skips bob");
+        assert!(
+            session.memberships().await.unwrap().iter().all(|m| m.user_id != bob_id()),
+            "a read leaves him out too"
+        );
+    }
+
+    #[async_test]
+    async fn test_a_kicked_participant_leaves_the_call_and_the_key_rotates_away() {
+        assert_a_removal_rotates_the_key_away(
+            EventFactory::new()
+                .sender(owned_user_id!("@moderator:localhost"))
+                .member(bob_id())
+                .kicked(bob_id()),
+        )
+        .await;
+    }
+
+    #[async_test]
+    async fn test_a_banned_participant_leaves_the_call_and_the_key_rotates_away() {
+        assert_a_removal_rotates_the_key_away(
+            EventFactory::new()
+                .sender(owned_user_id!("@moderator:localhost"))
+                .member(bob_id())
+                .banned(bob_id()),
+        )
+        .await;
+    }
+
+    /// Leaving the room without hanging up first (a crashed client, a
+    /// "leave room" from another device) leaves the membership behind too.
+    #[async_test]
+    async fn test_a_participant_leaving_the_room_leaves_the_call_and_the_key_rotates_away() {
+        assert_a_removal_rotates_the_key_away(
+            EventFactory::new().member(bob_id()).membership(MembershipState::Leave),
+        )
+        .await;
+    }
+
+    /// A lazy-loaded member list: the store has no `m.room.member` event for
+    /// a call member. They are not counted on a guess; their membership is
+    /// looked up on its own, and once it says joined they are in the call and
+    /// get the key — without the room changing again.
+    #[async_test]
+    async fn test_an_unknown_call_member_is_looked_up_and_gets_the_key() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let (client, _room, session) = joined_session(&server).await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "membership": "join" })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+        let mut updates = session.subscribe();
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+
+        let first = next_roster(&mut updates).await;
+        assert!(first.iter().all(|m| m.user_id != bob_id()), "not known yet: not in the call");
+        roster_with(&mut updates, &bob_id()).await;
+        assert!(known(&session).contains_key("@bob:localhost:BOB"), "the key round counts him");
+    }
+
+    /// A look-up that fails is retried on a timer: in a quiet room nothing
+    /// else would bring the participant the key.
+    #[async_test]
+    async fn test_a_failed_look_up_is_retried_in_a_quiet_room() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let (client, _room, session) = joined_session(&server).await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(server.server())
+            .await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "membership": "join" })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+        let mut updates = session.subscribe();
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+
+        // No further sync: only the retry timer can bring bob in.
+        roster_with(&mut updates, &bob_id()).await;
+        assert!(known(&session).contains_key("@bob:localhost:BOB"));
+    }
+
+    /// The reported scenario: we join a live call in a lazy-loaded room, the
+    /// look-up of a participant we cannot place fails, and the room stays
+    /// quiet. The observer retries on its own and the participant gets the
+    /// key.
+    #[async_test]
+    async fn test_a_look_up_that_failed_at_join_is_retried_in_a_quiet_room() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let client = server.client_builder().build().await;
+        mock_transports(&server).await;
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        let sdk_room =
+            server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server.mock_room_send_state().ok(event_id!("$membership")).mount().await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(server.server())
+            .await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "membership": "join" })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let session = sdk_room.matrix_rtc_session().unwrap();
+        let mut updates = session.subscribe();
+        session.join(JoinConfiguration::default()).await.unwrap();
+        assert!(known(&session).is_empty(), "the look-up at join failed: bob is not counted yet");
+
+        roster_with(&mut updates, &bob_id()).await;
+        assert!(known(&session).contains_key("@bob:localhost:BOB"), "and he gets the key");
+    }
+
+    /// A kick lost in a timeline gap: the phone was offline, the sync came
+    /// back limited, and the lazy-loaded member list never delivered the
+    /// kick, so the store still says bob is joined. The gap marks the member
+    /// list missing; its reload brings the kick in, and the key rotates away
+    /// from him.
+    #[async_test]
+    async fn test_a_kick_lost_in_a_timeline_gap_is_healed_by_reloading_the_member_list() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let f = EventFactory::new();
+        // The member list as it was at join: bob is in the room.
+        let before_the_gap = Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/members$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({ "chunk": [EventFactory::new().room(room()).member(bob_id()).into_raw::<ruma::events::room::member::RoomMemberEvent>()] }),
+            ))
+            .mount_as_scoped(server.server())
+            .await;
+        let (client, sdk_room, session) = joined_session(&server).await;
+
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !sdk_room.are_members_synced() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the member list loads at the start of the call");
+        session.synchronise_memberships().await.unwrap();
+        assert_eq!(known(&session).len(), 1, "bob is in the call");
+        drop(before_the_gap);
+
+        // The member list now: bob was kicked during the gap.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/members$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk": [EventFactory::new()
+                    .room(room())
+                    .sender(owned_user_id!("@moderator:localhost"))
+                    .member(bob_id())
+                    .kicked(bob_id())
+                    .into_raw::<ruma::events::room::member::RoomMemberEvent>()]
+            })))
+            .expect(1)
+            .mount(server.server())
+            .await;
+
+        let mut updates = session.subscribe();
+        // The limited sync: no kick in it.
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).set_timeline_limited()).await;
+
+        let rotated_to = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let MatrixRtcUpdate::OwnEncryptionKeyChanged { key } =
+                    updates.recv().await.expect("the session is alive")
+                {
+                    break key.index;
+                }
+            }
+        })
+        .await
+        .expect("the reloaded member list rotates the key away from bob");
+        assert_eq!(rotated_to, 1);
+        assert!(known(&session).is_empty(), "bob is out of the call");
+        assert!(!unshared(&session).contains("@bob:localhost:BOB"), "and not owed the key");
+    }
+
+    /// Wait for a member list reload to end.
+    async fn reload_finished(reload: &MemberListReload) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !reload.task.as_ref().is_some_and(|task| task.is_finished()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reload ends");
+    }
+
+    /// A reload finished, and before the observer looked again the list was
+    /// marked missing anew (another gap, a new room subscription): that is a
+    /// new gap, and it gets its own reload — the reload must not latch off
+    /// for the rest of the call.
+    #[async_test]
+    async fn test_a_member_list_missing_again_after_a_reload_is_reloaded_again() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sdk_room = server.sync_joined_room(&client, room()).await;
+        server.mock_get_members().ok(Vec::new()).expect(2).mount().await;
+
+        let mut reload = MemberListReload::default();
+        reload.reload_if_missing(&sdk_room);
+        reload_finished(&reload).await;
+        assert!(sdk_room.are_members_synced());
+
+        // Missing again before the observer saw the list loaded.
+        sdk_room.mark_members_missing();
+        reload.reload_if_missing(&sdk_room);
+        reload_finished(&reload).await;
+        assert!(sdk_room.are_members_synced(), "the second gap is healed too");
+    }
+
+    /// A reload that fails keeps trying on its own until the list loads.
+    #[async_test]
+    async fn test_a_failed_member_list_reload_retries_until_it_loads() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sdk_room = server.sync_joined_room(&client, room()).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/members$"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({ "errcode": "M_UNKNOWN", "error": "Try later" })),
+            )
+            .up_to_n_times(1)
+            .with_priority(1)
+            .expect(1)
+            .mount(server.server())
+            .await;
+        server.mock_get_members().ok(Vec::new()).expect(1).mount().await;
+
+        let mut reload = MemberListReload::default();
+        reload.reload_if_missing(&sdk_room);
+        // While it waits to retry, the observer starts no second reload.
+        reload.reload_if_missing(&sdk_room);
+        reload_finished(&reload).await;
+        assert!(sdk_room.are_members_synced());
+    }
+
+    /// The retry schedule: armed once at start, backing off while look-ups
+    /// keep failing, and quiet once everybody is known — never due in a
+    /// loop.
+    #[test]
+    fn member_look_ups_back_off_and_go_quiet() {
+        let bob = BTreeSet::from([bob_id()]);
+        let mut look_ups = MemberLookups::new();
+        assert!(look_ups.retry_delay().is_some(), "armed for one round after start");
+
+        // A newly unknown member is due at once, the armed retry is not.
+        assert_eq!(look_ups.due(&bob), bob);
+        look_ups.record(&bob, bob.clone());
+        assert!(look_ups.due(&bob).is_empty(), "failed, and the retry is not due yet");
+
+        // The retry comes due: consumed, failed again, rescheduled further.
+        look_ups.next_retry = Some(std::time::Instant::now());
+        assert_eq!(look_ups.due(&bob), bob);
+        assert_eq!(look_ups.retry_delay(), None, "consumed");
+        look_ups.record(&bob, bob.clone());
+        assert_eq!(look_ups.delay, MEMBER_LOOKUP_RETRY_MIN);
+        look_ups.next_retry = Some(std::time::Instant::now());
+        look_ups.due(&bob);
+        look_ups.record(&bob, bob.clone());
+        assert_eq!(look_ups.delay, MEMBER_LOOKUP_RETRY_MIN * 2, "backing off");
+
+        // Known now: nothing pending.
+        look_ups.next_retry = Some(std::time::Instant::now());
+        look_ups.due(&bob);
+        look_ups.record(&bob, BTreeSet::new());
+        assert_eq!(look_ups.retry_delay(), None);
+        assert!(look_ups.due(&BTreeSet::new()).is_empty());
+    }
+
+    /// Reading the call with a member whose room membership cannot be told
+    /// fails rather than answer without them: a caller deciding whether the
+    /// call is empty must not read "only me" for a live call.
+    #[async_test]
+    async fn test_memberships_fail_while_a_call_member_cannot_be_told() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sdk_room = server.sync_joined_room(&client, room()).await;
+        let session = sdk_room.matrix_rtc_session().unwrap();
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+
+        let failing = bob_lookup()
+            .respond_with(ResponseTemplate::new(500))
+            .mount_as_scoped(server.server())
+            .await;
+        assert!(matches!(session.memberships().await, Err(Error::UnknownCallMembers(1))));
+        drop(failing);
+
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "membership": "join" })))
+            .mount(server.server())
+            .await;
+        let memberships = session.memberships().await.unwrap();
+        assert!(memberships.iter().any(|m| m.user_id == bob_id()), "looked up: joined");
+    }
+
+    /// A user the room has no member event for at all was never in it: the
+    /// look-up answers `M_NOT_FOUND`, and they are out of the call.
+    #[async_test]
+    async fn test_a_call_member_the_room_never_had_is_not_in_the_call() {
+        let server = MatrixMockServer::new().await;
+        let client = server.client_builder().build().await;
+        let sdk_room = server.sync_joined_room(&client, room()).await;
+        let session = sdk_room.matrix_rtc_session().unwrap();
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        bob_lookup()
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "errcode": "M_NOT_FOUND",
+                "error": "Event not found."
+            })))
+            .mount(server.server())
+            .await;
+
+        let memberships = session.memberships().await.unwrap();
+        assert!(memberships.iter().all(|m| m.user_id != bob_id()));
+    }
+
+    /// A member list requested before a kick and answered after the kick
+    /// synced describes the room before the kick. It must not bring the
+    /// kicked user back into the call, nor give them the key.
+    #[async_test]
+    async fn test_a_member_list_older_than_a_kick_does_not_bring_the_member_back() {
+        let server = MatrixMockServer::new().await;
+        let _delayed = mock_delayed_leave(&server, "delay-1").await;
+        let (client, sdk_room, session) = joined_session(&server).await;
+
+        let f = EventFactory::new();
+        let bob = bob_membership(&f, event_id!("$bob-1"));
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
+        session.synchronise_memberships().await.unwrap();
+        assert_eq!(known(&session).len(), 1, "bob is in the call");
+
+        // The member list, answered slowly, with bob still joined.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.*/members$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "chunk": [f.room(room()).member(bob_id()).into_raw::<ruma::events::room::member::RoomMemberEvent>()] }))
+                    .set_delay(Duration::from_millis(500)),
+            )
+            .mount(server.server())
+            .await;
+        let loading = {
+            let sdk_room = sdk_room.clone();
+            spawn(async move { sdk_room.sync_members().await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut updates = session.subscribe();
+        let kick = EventFactory::new()
+            .sender(owned_user_id!("@moderator:localhost"))
+            .member(bob_id())
+            .kicked(bob_id());
+        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(kick)).await;
+        loading.await.unwrap().unwrap();
+
+        let rotated_to = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let MatrixRtcUpdate::OwnEncryptionKeyChanged { key } =
+                    updates.recv().await.expect("the session is alive")
+                {
+                    break key.index;
+                }
+            }
+        })
+        .await
+        .expect("the kick rotates the key");
+        assert_eq!(rotated_to, 1);
+
+        let bob = sdk_room.get_member_no_sync(&bob_id()).await.unwrap().expect("bob is known");
+        assert_eq!(
+            *bob.membership(),
+            MembershipState::Leave,
+            "the stale list did not undo the kick"
+        );
+        session.synchronise_memberships().await.unwrap();
+        assert!(known(&session).is_empty(), "bob is not back in the call");
+        assert!(!unshared(&session).contains("@bob:localhost:BOB"), "nor owed the key");
+    }
+
     /// The ring index is the u8 the wire carries: a rotation off 255 wraps
     /// to 0 rather than failing or sticking.
     #[async_test]
@@ -2796,7 +3734,12 @@ mod reconciliation_tests {
 
         let f = EventFactory::new();
         let bob = bob_membership(&f, event_id!("$bob-1"));
-        server.sync_room(&client, JoinedRoomBuilder::new(room()).add_state_event(bob)).await;
+        server
+            .sync_room(
+                &client,
+                JoinedRoomBuilder::new(room()).add_state_event(bob).add_state_event(bob_joined(&f)),
+            )
+            .await;
         session.synchronise_memberships().await.unwrap();
         {
             let mut state = session.inner.state.lock().await;
@@ -2942,8 +3885,8 @@ mod language_tests {
     //! membership — published at join, changed mid-call without disturbing
     //! anything else the membership carries, and read for every member.
 
-    use matrix_sdk_test::{JoinedRoomBuilder, async_test};
-    use ruma::{event_id, events::AnySyncStateEvent, room_id};
+    use matrix_sdk_test::{JoinedRoomBuilder, async_test, event_factory::EventFactory};
+    use ruma::{event_id, events::AnySyncStateEvent, owned_user_id, room_id};
     use serde_json::{Value as JsonValue, json};
     use wiremock::{
         Mock, ResponseTemplate,
@@ -3278,6 +4221,7 @@ mod language_tests {
             "$carol-1",
             None,
         );
+        let f = EventFactory::new();
         // Mallory writes a membership — and a language — under Dave's key.
         let forged = raw_membership(
             "@mallory:localhost",
@@ -3292,7 +4236,12 @@ mod language_tests {
                 JoinedRoomBuilder::new(room())
                     .add_state_event(bob)
                     .add_state_event(carol)
-                    .add_state_event(forged),
+                    .add_state_event(forged)
+                    // All three are joined: the forgery alone is what leaves
+                    // Mallory's membership out.
+                    .add_state_event(f.member(owned_user_id!("@bob:localhost")))
+                    .add_state_event(f.member(owned_user_id!("@carol:localhost")))
+                    .add_state_event(f.member(owned_user_id!("@mallory:localhost"))),
             )
             .await;
 

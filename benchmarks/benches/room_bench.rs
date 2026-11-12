@@ -1,3 +1,6 @@
+// Modified by the Spiral authors, 2026: the member list benchmarks pass
+// receive_all_members the MemberListRequest it now takes.
+
 #![recursion_limit = "256"]
 
 use std::time::Duration;
@@ -79,7 +82,7 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
         ))
         .expect("Could not set session meta");
 
-    base_client.get_or_create_room(&room_id, RoomState::Joined);
+    let room = base_client.get_or_create_room(&room_id, RoomState::Joined);
 
     let request = get_member_events::v3::Request::new(room_id.clone());
     let response = get_member_events::v3::Response::new(member_events);
@@ -92,7 +95,8 @@ pub fn receive_all_members_benchmark(c: &mut Criterion) {
 
     group.bench_function(BenchmarkId::new("Handle /members request [SQLite]", name), |b| {
         b.to_async(&runtime).iter(|| async {
-            base_client.receive_all_members(&room_id, &request, &response).await.unwrap();
+            let started = room.start_member_list_request();
+            base_client.receive_all_members(&room_id, &request, &response, &started).await.unwrap();
         });
     });
 
@@ -149,12 +153,13 @@ pub fn members_benchmark(c: &mut Criterion) {
         ))
         .expect("Could not set session meta");
 
-    base_client.get_or_create_room(&room_id, RoomState::Joined);
+    let room = base_client.get_or_create_room(&room_id, RoomState::Joined);
 
     let request = get_member_events::v3::Request::new(room_id.clone());
     let response = get_member_events::v3::Response::new(member_events);
+    let started = room.start_member_list_request();
     runtime
-        .block_on(base_client.receive_all_members(&room_id, &request, &response))
+        .block_on(base_client.receive_all_members(&room_id, &request, &response, &started))
         .expect("Could not receive the members");
 
     let room = base_client.get_room(&room_id).unwrap();

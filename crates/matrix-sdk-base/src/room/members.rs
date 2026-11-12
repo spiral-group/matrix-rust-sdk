@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: MemberListRequest, which tracks the
+// members a sync updates while a member list request is in flight.
+
 use std::{
     collections::{BTreeSet, HashMap},
     mem, slice,
@@ -583,6 +586,89 @@ pub fn normalize_power_level(power_level: Int, max_power_level: i64) -> Int {
 
     Int::try_from(power_level.clamp(0, 100))
         .expect("We clamped the normalized power level so they must fit into the Int")
+}
+
+/// The member list requests of a room that are in flight, and the members a
+/// sync updated meanwhile.
+///
+/// A `/members` response describes the room as it was when the server
+/// answered; a sync processed after the request was sent may carry newer
+/// member events (a kick, say). Applied as is, the response would overwrite
+/// them with the older state. While a request is in flight, every member a
+/// sync updates is recorded here with its position, so the response can
+/// leave those members as the sync left them. Nothing is kept while no
+/// request is in flight.
+#[derive(Debug, Default)]
+pub(crate) struct MemberListRequests {
+    inner: std::sync::Mutex<MemberListRequestsInner>,
+}
+
+#[derive(Debug, Default)]
+struct MemberListRequestsInner {
+    /// How many member updates sync has delivered for the room.
+    position: u64,
+    /// How many member list requests are in flight.
+    in_flight: usize,
+    /// While a request is in flight: the position of each member's last
+    /// update from sync.
+    synced_members: HashMap<OwnedUserId, u64>,
+}
+
+/// A member list request in flight for a room, taken with
+/// [`Room::start_member_list_request`] before the request is sent and handed
+/// to [`BaseClient::receive_all_members`] with its response.
+///
+/// [`BaseClient::receive_all_members`]: crate::BaseClient::receive_all_members
+#[derive(Debug)]
+pub struct MemberListRequest {
+    requests: Arc<MemberListRequests>,
+    started_at: u64,
+}
+
+impl MemberListRequest {
+    /// Whether a sync updated `user_id`'s membership after this request was
+    /// started: the response must not overwrite that update.
+    pub(crate) fn synced_after_start(&self, user_id: &UserId) -> bool {
+        let inner = self.requests.inner.lock().unwrap();
+        inner.synced_members.get(user_id).is_some_and(|position| *position > self.started_at)
+    }
+}
+
+impl Drop for MemberListRequest {
+    fn drop(&mut self) {
+        let mut inner = self.requests.inner.lock().unwrap();
+        inner.in_flight = inner.in_flight.saturating_sub(1);
+        if inner.in_flight == 0 {
+            inner.synced_members = HashMap::new();
+        }
+    }
+}
+
+impl Room {
+    /// Start a member list request: take this before sending `/members`, and
+    /// hand it to [`BaseClient::receive_all_members`] with the response, so
+    /// the response cannot overwrite a member event a sync delivered while
+    /// the request was in flight.
+    ///
+    /// [`BaseClient::receive_all_members`]: crate::BaseClient::receive_all_members
+    pub fn start_member_list_request(&self) -> MemberListRequest {
+        let mut inner = self.member_list_requests.inner.lock().unwrap();
+        inner.in_flight += 1;
+        MemberListRequest {
+            requests: self.member_list_requests.clone(),
+            started_at: inner.position,
+        }
+    }
+
+    /// Record that a sync updated `user_id`'s membership in this room.
+    pub(crate) fn record_synced_member_update(&self, user_id: &UserId) {
+        let mut inner = self.member_list_requests.inner.lock().unwrap();
+        inner.position += 1;
+        if inner.in_flight > 0 {
+            let position = inner.position;
+            inner.synced_members.insert(user_id.to_owned(), position);
+        }
+    }
 }
 
 #[cfg(test)]

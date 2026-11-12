@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: the room's member list requests in
+// flight (MemberListRequest).
+
 #![allow(clippy::assign_op_pattern)] // Triggered by bitflags! usage
 
 mod call;
@@ -26,9 +29,12 @@ mod state;
 mod tags;
 mod tombstone;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[cfg(feature = "unstable-msc4354")]
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::Arc,
+};
 
 pub use call::CallIntentConsensus;
 pub use create::*;
@@ -37,7 +43,7 @@ pub(crate) use display_name::{RoomSummary, UpdatedRoomDisplayName};
 pub use encryption::EncryptionState;
 use eyeball::{AsyncLock, SharedObservable};
 use futures_util::{Stream, StreamExt};
-pub use members::{RoomMember, RoomMembersUpdate, RoomMemberships};
+pub use members::{MemberListRequest, RoomMember, RoomMembersUpdate, RoomMemberships};
 pub(crate) use room_info::SyncInfo;
 pub use room_info::{
     BaseRoomInfo, RoomInfo, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomRecencyStamp,
@@ -114,6 +120,9 @@ pub struct Room {
     /// event don't pay for a map and its maintenance task.
     #[cfg(feature = "unstable-msc4354")]
     pub(super) sticky_events: Arc<OnceLock<crate::sticky::StickyEvents>>,
+
+    /// The member list requests in flight, and what sync changed meanwhile.
+    pub(super) member_list_requests: Arc<members::MemberListRequests>,
 }
 
 impl Room {
@@ -145,6 +154,7 @@ impl Room {
             room_member_updates_sender,
             #[cfg(feature = "unstable-msc4354")]
             sticky_events: Default::default(),
+            member_list_requests: Default::default(),
         }
     }
 

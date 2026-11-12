@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: the senders of call memberships known
+// not to be joined to the room, which no reading of the room's call counts.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, atomic::AtomicBool},
@@ -23,7 +26,7 @@ use eyeball::Subscriber;
 use matrix_sdk_common::{ROOM_VERSION_FALLBACK, ROOM_VERSION_RULES_FALLBACK};
 use ruma::{
     EventId, MxcUri, OwnedEventId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedUserId,
-    RoomAliasId, RoomId, RoomVersionId,
+    RoomAliasId, RoomId, RoomVersionId, UserId,
     api::client::sync::sync_events::v3::RoomSummary as RumaSummary,
     events::{
         AnyPossiblyRedactedStateEventContent, AnyStrippedStateEvent, AnySyncStateEvent,
@@ -211,6 +214,20 @@ pub struct BaseRoomInfo {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(crate) rtc_member_events:
         BTreeMap<CallMemberStateKey, MinimalStateEvent<PossiblyRedactedCallMemberEventContent>>,
+    /// Senders of [`Self::rtc_member_events`] whose room membership is known
+    /// not to be `join`: they left, were kicked or banned, or are only
+    /// invited.
+    ///
+    /// A call membership is a state event only its sender can clear, and a
+    /// user who is no longer in the room cannot send one, so a removed
+    /// participant's membership outlives them until it expires. Only a
+    /// joined member is in the call: the memberships of these users are left
+    /// out of every call reading. A sender whose membership is not known
+    /// (the member list is lazy-loaded) is not in this set.
+    ///
+    /// Kept to the senders of `rtc_member_events`.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty", default)]
+    pub(crate) rtc_member_senders_not_joined: BTreeSet<OwnedUserId>,
     /// Whether this room has been manually marked as unread.
     #[serde(default)]
     pub(crate) is_marked_unread: bool,
@@ -557,6 +574,47 @@ impl BaseRoomInfo {
         }
     }
 
+    /// Whether `user_id` sent one of the [`Self::rtc_member_events`].
+    pub(crate) fn has_rtc_member_events_from(&self, user_id: &UserId) -> bool {
+        self.rtc_member_events.keys().any(|state_key| state_key.user_id() == user_id)
+    }
+
+    /// The users that sent one of the [`Self::rtc_member_events`].
+    pub(crate) fn rtc_member_senders(&self) -> BTreeSet<OwnedUserId> {
+        self.rtc_member_events.keys().map(|state_key| state_key.user_id().to_owned()).collect()
+    }
+
+    /// Record the room membership of `user_id`, a sender of call memberships:
+    /// `Some(true)` when they are joined, `Some(false)` when they are known
+    /// not to be, `None` when it is not known, which changes nothing.
+    ///
+    /// Returns whether the set of senders left out of the call changed.
+    pub(crate) fn set_rtc_member_sender_joined(
+        &mut self,
+        user_id: &UserId,
+        joined: Option<bool>,
+    ) -> bool {
+        match joined {
+            Some(true) => self.rtc_member_senders_not_joined.remove(user_id),
+            Some(false) if self.has_rtc_member_events_from(user_id) => {
+                self.rtc_member_senders_not_joined.insert(user_id.to_owned())
+            }
+            Some(false) | None => false,
+        }
+    }
+
+    /// Forget the senders left out of the call that have no call membership
+    /// left. Returns whether anything was forgotten.
+    pub(crate) fn prune_rtc_member_senders_not_joined(&mut self) -> bool {
+        if self.rtc_member_senders_not_joined.is_empty() {
+            return false;
+        }
+        let senders = self.rtc_member_senders();
+        let before = self.rtc_member_senders_not_joined.len();
+        self.rtc_member_senders_not_joined.retain(|user_id| senders.contains(user_id));
+        self.rtc_member_senders_not_joined.len() != before
+    }
+
     pub fn handle_notable_tags(&mut self, tags: &Tags) {
         let mut notable_tags = RoomNotableTags::empty();
 
@@ -590,6 +648,7 @@ impl Default for BaseRoomInfo {
             tombstone: None,
             topic: None,
             rtc_member_events: BTreeMap::new(),
+            rtc_member_senders_not_joined: BTreeSet::new(),
             is_marked_unread: false,
             is_marked_unread_source: AccountDataSource::Unstable,
             notable_tags: RoomNotableTags::empty(),
@@ -1152,6 +1211,11 @@ impl RoomInfo {
             .base_info
             .rtc_member_events
             .iter()
+            // Only a joined member is in the call; see
+            // `BaseRoomInfo::rtc_member_senders_not_joined`.
+            .filter(|(state_key, _)| {
+                !self.base_info.rtc_member_senders_not_joined.contains(state_key.user_id())
+            })
             .flat_map(|(state_key, ev)| {
                 ev.content.active_memberships(None).into_iter().map(move |m| (state_key.clone(), m))
             })
@@ -1186,7 +1250,7 @@ impl RoomInfo {
     /// user (e.g. profile-field mirroring) should use this.
     pub fn is_device_in_active_room_call(
         &self,
-        user_id: &ruma::UserId,
+        user_id: &UserId,
         device_id: &ruma::DeviceId,
     ) -> bool {
         self.active_room_call_memberships().iter().any(|(state_key, membership)| {

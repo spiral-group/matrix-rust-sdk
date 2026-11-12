@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: StateChanges::forget_member.
+
 //! The state store holds the overall state for rooms, users and their
 //! profiles and their timelines. It is an overall cache for faster access
 //! and convenience- accessible through `Store`.
@@ -739,6 +741,22 @@ impl StateChanges {
             .or_else(|| self.stripped_state_static_for_key::<C, K>(room_id, state_key))?
             .deserialize()
             .ok()
+    }
+
+    /// Drop every change these `StateChanges` make to `user_id`'s membership
+    /// and profile in the given room.
+    pub(crate) fn forget_member(&mut self, room_id: &RoomId, user_id: &UserId) {
+        if let Some(state) = self.state.get_mut(room_id)
+            && let Some(members) = state.get_mut(&StateEventType::RoomMember)
+        {
+            members.remove(user_id.as_str());
+        }
+        if let Some(profiles) = self.profiles.get_mut(room_id) {
+            profiles.remove(user_id);
+        }
+        if let Some(profiles) = self.profiles_to_delete.get_mut(room_id) {
+            profiles.retain(|profile| profile != user_id);
+        }
     }
 
     /// Get the member for the given user in the given room from an event

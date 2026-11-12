@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: records which senders of call
+// memberships are not joined to the room, and which members a sync updated
+// while a member list request is in flight.
+
 use std::collections::BTreeSet;
 
 use as_variant::as_variant;
@@ -35,7 +39,8 @@ pub mod sync {
     use ruma::{
         OwnedUserId, RoomId, UserId,
         events::{
-            AnySyncStateEvent, AnySyncTimelineEvent, StateEventType, room::member::MembershipState,
+            AnySyncStateEvent, AnySyncTimelineEvent, StateEventType,
+            call::member::CallMemberStateKey, room::member::MembershipState,
         },
     };
     use tracing::instrument;
@@ -46,7 +51,8 @@ pub mod sync {
     use crate::{
         RoomInfo, RoomInfoNotableUpdateReasons, RoomState,
         store::{
-            AvatarCache, BaseStateStore, Result as StoreResult, ambiguity_map::AmbiguityCache,
+            AvatarCache, BaseStateStore, Result as StoreResult, StateStoreExt,
+            ambiguity_map::AmbiguityCache,
         },
         sync::State,
         utils::RawStateEventWithKeys,
@@ -103,9 +109,30 @@ pub mod sync {
     where
         U: NewUsers,
     {
+        // The senders of the call memberships in this batch, whose room
+        // membership is checked once the whole batch is in.
+        let mut call_member_senders = BTreeSet::new();
+        // For a member list request in flight, which members this sync
+        // updates (see `Room::start_member_list_request`).
+        let room = state_store.room(&room_info.room_id);
+
         for mut raw_event in raw_events {
             match (&raw_event.event_type, raw_event.state_key.as_str()) {
-                (StateEventType::RoomMember, _) => {
+                (StateEventType::CallMember, state_key) => {
+                    if let Ok(state_key) = state_key.parse::<CallMemberStateKey>() {
+                        call_member_senders.insert(state_key.user_id().to_owned());
+                    }
+
+                    room_info.handle_state_event(&mut raw_event);
+                }
+
+                (StateEventType::RoomMember, state_key) => {
+                    if let Some(room) = &room
+                        && let Ok(user_id) = <&UserId>::try_from(state_key)
+                    {
+                        room.record_synced_member_update(user_id);
+                    }
+
                     room_info.handle_state_event(&mut raw_event);
 
                     dispatch_room_member(
@@ -170,6 +197,52 @@ pub mod sync {
                 .or_default()
                 .insert(raw_event.state_key, raw_event.raw);
         }
+
+        update_call_member_senders(context, room_info, &call_member_senders, state_store).await?;
+
+        Ok(())
+    }
+
+    /// Only a joined member of the room is in its call: record which senders
+    /// of call memberships are not, after a batch of state events.
+    ///
+    /// A call membership is a state event only its sender can clear, so it
+    /// outlives a kick, a ban or a leave until it expires. This runs once the
+    /// whole batch is in because a batch of room state is not ordered: a
+    /// sender's old call membership may come after the event that removed
+    /// them.
+    ///
+    /// A sender is re-checked when this batch carries their `m.room.member`
+    /// event or one of their call memberships; for the latter, the
+    /// membership comes from the store. A sender the store knows nothing
+    /// about (a lazy-loaded member list) is not known to have left, and
+    /// stays counted: this feeds what a room shows about its call, and it
+    /// must not hide a live call in a room whose members were never loaded.
+    async fn update_call_member_senders(
+        context: &Context,
+        room_info: &mut RoomInfo,
+        call_member_senders: &BTreeSet<OwnedUserId>,
+        state_store: &BaseStateStore,
+    ) -> StoreResult<()> {
+        let room_id = room_info.room_id.clone();
+
+        for user_id in room_info.base_info.rtc_member_senders() {
+            let joined = if let Some(member) = context.state_changes.member(&room_id, &user_id) {
+                Some(member.content.membership == MembershipState::Join)
+            } else if call_member_senders.contains(&user_id) {
+                state_store
+                    .get_member_event(&room_id, &user_id)
+                    .await?
+                    .and_then(|event| event.deserialize().ok())
+                    .map(|event| *event.membership() == MembershipState::Join)
+            } else {
+                None
+            };
+
+            room_info.base_info.set_rtc_member_sender_joined(&user_id, joined);
+        }
+
+        room_info.base_info.prune_rtc_member_senders_not_joined();
 
         Ok(())
     }

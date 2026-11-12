@@ -117,6 +117,12 @@ pub enum Error {
     #[error(transparent)]
     Http(Box<crate::HttpError>),
 
+    /// The room membership of this many call members could not be told:
+    /// the store has no member event for them and looking them up on the
+    /// homeserver failed. The call is not read without them.
+    #[error("the room membership of {0} call member(s) is not known")]
+    UnknownCallMembers(usize),
+
     /// A payload could not be built or parsed.
     #[error(transparent)]
     Serialization(#[from] serde_json::Error),

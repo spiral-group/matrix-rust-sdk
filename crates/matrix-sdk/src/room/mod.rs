@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: the /members load takes a
+// MemberListRequest before the request is sent.
+
 //! High-level room API
 
 use std::{
@@ -1096,6 +1099,10 @@ impl Room {
             .members_request_deduplicated_handler
             .run(self.room_id().to_owned(), async move {
                 let request = get_member_events::v3::Request::new(self.inner.room_id().to_owned());
+                // Before the request leaves: a sync that lands while it is in
+                // flight is newer than the response for the members it
+                // touches.
+                let started = self.inner.start_member_list_request();
                 let response = self
                     .client
                     .send(request.clone())
@@ -1112,6 +1119,7 @@ impl Room {
                     self.room_id(),
                     &request,
                     &response,
+                    &started,
                 ))
                 .await?;
 

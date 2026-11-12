@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: tests that only joined members of the
+// room count as being in its call.
+
 use ruma::{OwnedUserId, events::rtc::notification::CallIntent};
 
 use super::Room;
@@ -82,7 +85,9 @@ mod tests {
     use std::{ops::Sub, sync::Arc, time::Duration};
 
     use assign::assign;
-    use matrix_sdk_test::{User, event_factory::EventFactory};
+    use matrix_sdk_test::{
+        JoinedRoomBuilder, SyncResponseBuilder, User, async_test, event_factory::EventFactory,
+    };
     use ruma::{
         DeviceId, EventId, MilliSecondsSinceUnixEpoch, OwnedUserId, device_id, event_id,
         events::{
@@ -92,6 +97,7 @@ mod tests {
                 CallMemberEventContent, CallMemberStateKey, Focus, LegacyMembershipData,
                 LegacyMembershipDataInit, LivekitFocus,
             },
+            room::member::MembershipState,
             rtc::notification::CallIntent,
         },
         room_id,
@@ -105,7 +111,9 @@ mod tests {
         CallIntentConsensus,
     };
     use crate::{
+        BaseClient,
         store::{MemoryStore, SaveLockedStateStore},
+        test_utils::logged_in_base_client,
         utils::RawStateEventWithKeys,
     };
 
@@ -496,5 +504,234 @@ mod tests {
         assert!(!room.is_device_in_active_room_call(User::Alice.into(), device_id!("DEVICE_C")));
         assert!(room.is_device_in_active_room_call(User::Bob.into(), device_id!("DEVICE_A")));
         assert!(!room.is_device_in_active_room_call(User::Bob.into(), device_id!("DEVICE_B")));
+    }
+
+    // Only a joined member of the room is in its call. A call membership is a
+    // state event only its sender can clear, so it outlives a kick, a ban or a
+    // leave until it expires; counting it showed a call in the room for hours
+    // after its last real participant was removed.
+
+    fn call_member(user: User, event_id: &EventId, minutes_ago: u32) -> Raw<AnySyncStateEvent> {
+        session_member_state_event(
+            event_id,
+            user,
+            Some(InitData { device_id: "DEVICE_0".into(), minutes_ago }),
+        )
+    }
+
+    fn joined(user: User) -> Raw<AnySyncStateEvent> {
+        EventFactory::new().member(user).into()
+    }
+
+    fn kicked(user: User) -> Raw<AnySyncStateEvent> {
+        EventFactory::new().sender(User::Alice).member(user).kicked(user).into()
+    }
+
+    fn banned(user: User) -> Raw<AnySyncStateEvent> {
+        EventFactory::new().sender(User::Alice).member(user).banned(user).into()
+    }
+
+    async fn call_room() -> (BaseClient, Room, SyncResponseBuilder) {
+        let client = logged_in_base_client(None).await;
+        let room = client.get_or_create_room(room_id!("!call:localhost"), RoomState::Joined);
+        (client, room, SyncResponseBuilder::new())
+    }
+
+    async fn sync_state(
+        client: &BaseClient,
+        builder: &mut SyncResponseBuilder,
+        events: Vec<Raw<AnySyncStateEvent>>,
+    ) {
+        let response = builder
+            .add_joined_room(
+                JoinedRoomBuilder::new(room_id!("!call:localhost")).add_state_bulk(events),
+            )
+            .build_sync_response();
+        client.receive_sync_response(response).await.unwrap();
+    }
+
+    #[async_test]
+    async fn test_a_call_member_removed_from_the_room_is_not_in_the_call() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(
+            &client,
+            &mut builder,
+            vec![
+                call_member(User::Bob, event_id!("$bob"), 10),
+                joined(User::Bob),
+                call_member(User::Carol, event_id!("$carol"), 5),
+                joined(User::Carol),
+            ],
+        )
+        .await;
+        assert_eq!(room.active_room_call_participants(), &[User::Bob, User::Carol]);
+
+        // A kick alone, no call-member event: Bob's membership stays in the
+        // room's state, and he is out of the call all the same.
+        sync_state(&client, &mut builder, vec![kicked(User::Bob)]).await;
+        assert_eq!(room.active_room_call_participants(), &[User::Carol]);
+        assert!(room.has_active_room_call());
+        assert!(!room.is_device_in_active_room_call(User::Bob.into(), device_id!("DEVICE_0")));
+
+        // A ban works the same, and the last participant gone is no call.
+        sync_state(&client, &mut builder, vec![banned(User::Carol)]).await;
+        assert_eq!(room.active_room_call_participants(), Vec::<OwnedUserId>::new());
+        assert!(!room.has_active_room_call());
+        assert_eq!(room.active_room_call_consensus_intent(), CallIntentConsensus::None);
+    }
+
+    #[async_test]
+    async fn test_a_removal_before_the_call_membership_in_one_batch_still_counts() {
+        let (client, room, mut builder) = call_room().await;
+
+        // Room state is not ordered: the kick may come first in the batch.
+        sync_state(
+            &client,
+            &mut builder,
+            vec![kicked(User::Bob), call_member(User::Bob, event_id!("$bob"), 10)],
+        )
+        .await;
+        assert!(!room.has_active_room_call());
+    }
+
+    #[async_test]
+    async fn test_a_call_membership_arriving_after_its_sender_left_is_not_counted() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(&client, &mut builder, vec![kicked(User::Bob)]).await;
+
+        // The stale membership comes in a later response (a wider required
+        // state, a gappy sync): the kick is in the store.
+        sync_state(&client, &mut builder, vec![call_member(User::Bob, event_id!("$bob"), 10)])
+            .await;
+        assert!(!room.has_active_room_call());
+    }
+
+    #[async_test]
+    async fn test_a_removed_call_member_who_rejoins_counts_again() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(
+            &client,
+            &mut builder,
+            vec![call_member(User::Bob, event_id!("$bob"), 10), joined(User::Bob)],
+        )
+        .await;
+        sync_state(&client, &mut builder, vec![kicked(User::Bob)]).await;
+        assert!(!room.has_active_room_call());
+
+        sync_state(&client, &mut builder, vec![joined(User::Bob)]).await;
+        assert_eq!(room.active_room_call_participants(), &[User::Bob]);
+    }
+
+    /// A lazy-loaded member list: the sender's membership is not known. The
+    /// room keeps showing their call — nothing says they left, and a room
+    /// list must not hide a live call in every room whose members it never
+    /// loaded. The call's keys are a different matter (the session fails
+    /// closed there).
+    #[async_test]
+    async fn test_a_call_member_whose_room_membership_is_unknown_still_counts() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(&client, &mut builder, vec![call_member(User::Bob, event_id!("$bob"), 10)])
+            .await;
+        assert_eq!(room.active_room_call_participants(), &[User::Bob]);
+    }
+
+    #[async_test]
+    async fn test_a_loaded_member_list_leaves_a_departed_call_member_out() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(
+            &client,
+            &mut builder,
+            vec![
+                call_member(User::Bob, event_id!("$bob"), 10),
+                call_member(User::Carol, event_id!("$carol"), 5),
+            ],
+        )
+        .await;
+        assert_eq!(room.active_room_call_participants(), &[User::Bob, User::Carol]);
+
+        let request = ruma::api::client::membership::get_member_events::v3::Request::new(
+            room.room_id().to_owned(),
+        );
+        let response = ruma::api::client::membership::get_member_events::v3::Response::new(vec![
+            EventFactory::new()
+                .room(room.room_id())
+                .sender(User::Alice)
+                .member(User::Bob)
+                .kicked(User::Bob)
+                .into_raw(),
+            EventFactory::new().room(room.room_id()).member(User::Carol).into_raw(),
+        ]);
+        let started = room.start_member_list_request();
+        client.receive_all_members(room.room_id(), &request, &response, &started).await.unwrap();
+
+        assert_eq!(room.active_room_call_participants(), &[User::Carol]);
+    }
+
+    fn member_list(
+        room: &Room,
+        members: Vec<Raw<ruma::events::room::member::RoomMemberEvent>>,
+    ) -> (
+        ruma::api::client::membership::get_member_events::v3::Request,
+        ruma::api::client::membership::get_member_events::v3::Response,
+    ) {
+        (
+            ruma::api::client::membership::get_member_events::v3::Request::new(
+                room.room_id().to_owned(),
+            ),
+            ruma::api::client::membership::get_member_events::v3::Response::new(members),
+        )
+    }
+
+    /// A member list requested before a kick and answered after the kick
+    /// synced describes the room before the kick. It must not put the
+    /// kicked user back: not in the store, not in the call.
+    #[async_test]
+    async fn test_a_member_list_older_than_a_kick_does_not_bring_the_member_back() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(
+            &client,
+            &mut builder,
+            vec![call_member(User::Bob, event_id!("$bob"), 10), joined(User::Bob)],
+        )
+        .await;
+
+        let started = room.start_member_list_request();
+        sync_state(&client, &mut builder, vec![kicked(User::Bob)]).await;
+        assert!(!room.has_active_room_call());
+
+        let (request, response) = member_list(
+            &room,
+            vec![EventFactory::new().room(room.room_id()).member(User::Bob).into_raw()],
+        );
+        client.receive_all_members(room.room_id(), &request, &response, &started).await.unwrap();
+
+        assert!(!room.has_active_room_call(), "the stale list does not put bob back in the call");
+        let bob = room.get_member(User::Bob.into()).await.unwrap().expect("bob is known");
+        assert_eq!(*bob.membership(), MembershipState::Leave, "nor back in the room");
+    }
+
+    /// The member list only ever takes a sender out of the call; putting one
+    /// back is left to sync, which never reports an older room than it has.
+    #[async_test]
+    async fn test_a_member_list_never_puts_a_removed_call_member_back() {
+        let (client, room, mut builder) = call_room().await;
+        sync_state(
+            &client,
+            &mut builder,
+            vec![call_member(User::Bob, event_id!("$bob"), 10), joined(User::Bob)],
+        )
+        .await;
+        sync_state(&client, &mut builder, vec![kicked(User::Bob)]).await;
+
+        // Started after the kick, answered by a server that has not caught
+        // up with it.
+        let started = room.start_member_list_request();
+        let (request, response) = member_list(
+            &room,
+            vec![EventFactory::new().room(room.room_id()).member(User::Bob).into_raw()],
+        );
+        client.receive_all_members(room.room_id(), &request, &response, &started).await.unwrap();
+
+        assert!(!room.has_active_room_call());
     }
 }

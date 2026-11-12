@@ -13,6 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: receive_all_members keeps a member that
+// a sync updated while the /members request was in flight, and a member list
+// only takes a call member out of the call.
+
 #[cfg(feature = "e2e-encryption")]
 use std::sync::Arc;
 #[cfg(all(feature = "e2e-encryption", feature = "unstable-msc4354"))]
@@ -40,7 +44,7 @@ use matrix_sdk_crypto::{
 #[cfg(doc)]
 use ruma::DeviceId;
 #[cfg(feature = "e2e-encryption")]
-use ruma::events::room::{history_visibility::HistoryVisibility, member::MembershipState};
+use ruma::events::room::history_visibility::HistoryVisibility;
 use ruma::{
     OwnedRoomId, OwnedUserId, RoomId, UserId,
     api::client::{self as api, sync::sync_events::v5},
@@ -48,7 +52,7 @@ use ruma::{
         StateEvent, StateEventType,
         ignored_user_list::IgnoredUserListEventContent,
         push_rules::{PushRulesEvent, PushRulesEventContent},
-        room::member::SyncRoomMemberEvent,
+        room::member::{MembershipState, SyncRoomMemberEvent},
     },
     profile::UserProfileUpdate,
     push::Ruleset,
@@ -68,7 +72,8 @@ use crate::{
     media::store::MediaStoreLock,
     response_processors::{self as processors, Context},
     room::{
-        Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMembersUpdate, RoomState,
+        MemberListRequest, Room, RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons,
+        RoomMembersUpdate, RoomState,
     },
     store::{
         AvatarCache, BaseStateStore, DynStateStore, MemoryStore, Result as StoreResult,
@@ -901,12 +906,16 @@ impl BaseClient {
     ///
     /// - `room_id` - The room id this response belongs to.
     /// - `response` - The raw response that was received from the server.
+    /// - `started` - Taken with [`Room::start_member_list_request`] before the
+    ///   request was sent: a member a sync updated since then keeps that
+    ///   update, as the response may predate it.
     #[instrument(skip_all, fields(?room_id))]
     pub async fn receive_all_members(
         &self,
         room_id: &RoomId,
         request: &api::membership::get_member_events::v3::Request,
         response: &api::membership::get_member_events::v3::Response,
+        started: &MemberListRequest,
     ) -> Result<()> {
         if request.membership.is_some() || request.not_membership.is_some() || request.at.is_some()
         {
@@ -939,6 +948,14 @@ impl BaseClient {
                     continue;
                 }
             };
+
+            // A sync delivered this member's membership after the request was
+            // sent: the response may predate it (a kick it does not know
+            // about), so the sync's version stands.
+            if started.synced_after_start(member.state_key()) {
+                debug!(user_id = %member.state_key(), "Keeping a member event newer than the member list");
+                continue;
+            }
 
             // TODO: All the actions in this loop used to be done only when the
             // membership event was not in the store before. This was changed
@@ -993,8 +1010,36 @@ impl BaseClient {
         {
             let state_store_guard = self.state_store_lock().lock().await;
 
+            // Re-checked under the lock a sync saves under: a sync processed
+            // since the loop above recorded its members before saving, and
+            // its save must not be followed by this older one for them.
+            let raced: Vec<OwnedUserId> = chunk
+                .iter()
+                .map(|member| member.state_key().clone())
+                .filter(|user_id| started.synced_after_start(user_id))
+                .collect();
+            for user_id in &raced {
+                context.state_changes.forget_member(room_id, user_id);
+            }
+            chunk.retain(|member| !raced.contains(member.state_key()));
+
             let mut room_info = room.clone_info();
             room_info.mark_members_synced();
+
+            // Only a joined member is in the room's call; see
+            // `BaseRoomInfo::rtc_member_senders_not_joined`. The member list
+            // only ever takes a sender OUT of the call: putting one back is
+            // left to sync, which is never older than the room it reports. A
+            // sender the response does not list stays as sync left them.
+            for user_id in room_info.base_info.rtc_member_senders() {
+                let not_joined = chunk.iter().any(|member| {
+                    *member.state_key() == user_id && *member.membership() != MembershipState::Join
+                });
+                if not_joined {
+                    room_info.base_info.set_rtc_member_sender_joined(&user_id, Some(false));
+                }
+            }
+
             context.state_changes.add_room(room_info);
 
             processors::changes::save_and_apply(
@@ -1813,7 +1858,8 @@ mod tests {
         )]);
 
         // It's correctly processed,
-        client.receive_all_members(room_id, &request, &response).await.unwrap();
+        let started = client.get_room(room_id).unwrap().start_member_list_request();
+        client.receive_all_members(room_id, &request, &response, &started).await.unwrap();
 
         let room = client.get_room(room_id).unwrap();
 
@@ -1882,7 +1928,8 @@ mod tests {
         )]);
 
         // It's correctly processed,
-        client.receive_all_members(room_id, &request, &response).await.unwrap();
+        let started = client.get_room(room_id).unwrap().start_member_list_request();
+        client.receive_all_members(room_id, &request, &response, &started).await.unwrap();
 
         let room = client.get_room(room_id).unwrap();
 
@@ -1925,7 +1972,8 @@ mod tests {
                 .into_raw(),
         ]);
 
-        client.receive_all_members(room_id, &request, &response).await.unwrap();
+        let started = client.get_room(room_id).unwrap().start_member_list_request();
+        client.receive_all_members(room_id, &request, &response, &started).await.unwrap();
 
         let room = client.get_room(room_id).unwrap();
         let member = room.get_member(joined_user_id).await.expect("ok").expect("exists");
@@ -1953,7 +2001,8 @@ mod tests {
                 .into_raw(),
         ]);
 
-        client.receive_all_members(room_id, &request, &response).await.unwrap();
+        let started = client.get_room(room_id).unwrap().start_member_list_request();
+        client.receive_all_members(room_id, &request, &response, &started).await.unwrap();
 
         // Then both display names are ambiguous.
         let room = client.get_room(room_id).unwrap();

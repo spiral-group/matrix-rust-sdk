@@ -13,6 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: exports MemberListRequest.
+
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
@@ -69,10 +71,10 @@ pub use http;
 #[cfg(feature = "e2e-encryption")]
 pub use matrix_sdk_crypto as crypto;
 pub use room::{
-    CallIntentConsensus, EncryptionState, PredecessorRoom, Room, RoomCreateWithCreatorEventContent,
-    RoomDisplayName, RoomHero, RoomHeroWithProfile, RoomInfo, RoomInfoNotableUpdate,
-    RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate, RoomMemberships, RoomRecencyStamp,
-    RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
+    CallIntentConsensus, EncryptionState, MemberListRequest, PredecessorRoom, Room,
+    RoomCreateWithCreatorEventContent, RoomDisplayName, RoomHero, RoomHeroWithProfile, RoomInfo,
+    RoomInfoNotableUpdate, RoomInfoNotableUpdateReasons, RoomMember, RoomMembersUpdate,
+    RoomMemberships, RoomRecencyStamp, RoomState, RoomStateFilter, SuccessorRoom, apply_redaction,
 };
 pub use store::{
     ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, DraftThumbnail,
