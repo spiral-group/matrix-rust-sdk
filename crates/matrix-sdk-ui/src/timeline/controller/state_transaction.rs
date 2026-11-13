@@ -14,7 +14,8 @@
 
 // Modified by the Spiral authors, 2026: an event that can't hold a read receipt
 // adds no implicit one for another user, a malformed state event included; a
-// thread root keeps its bundled summary until its replies are counted.
+// thread root shows ThreadInfo::summary, which keeps the server's bundled count
+// until the whole thread is counted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,6 +24,7 @@ use itertools::Itertools as _;
 use matrix_sdk::deserialized_responses::{
     ThreadSummary as SdkThreadSummary, TimelineEvent, TimelineEventKind, UnsignedEventLocation,
 };
+use matrix_sdk_base::event_cache::thread::BundledThreadSummary;
 use ruma::{
     EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedTransactionId, OwnedUserId, UserId,
     events::AnySyncTimelineEvent, push::Action, serde::Raw,
@@ -814,22 +816,19 @@ impl<'a, P: RoomDataProvider> TimelineStateTransaction<'a, P> {
             // Read the thread summary data from the `ThreadInfo` if it exists
             // in the Event Cache, because they are the most
             // up-to-date.
-            if let Ok(Some(thread_info)) =
+            if let Ok(Some(mut thread_info)) =
                 self.meta.event_cache.thread_info(self.focus.room_id(), event_id).await
             {
-                let computed = SdkThreadSummary {
-                    latest_reply: thread_info.latest_event.clone(),
-                    num_replies: thread_info.number_of_replies,
-                };
-                // A `ThreadInfo` the Event Cache created but never computed
-                // (the thread was opened, or a threaded receipt arrived,
-                // before any of its replies was on this device) knows
-                // nothing yet: the summary bundled with the event stands.
-                if thread_info.summary_computed {
-                    Some(computed)
-                } else {
-                    event.thread_summary().or(Some(computed))
+                // Until the whole thread is counted, the replies on this
+                // device are a lower bound and the server's bundled summary
+                // can be larger (see `ThreadInfo::summary`). The event in hand
+                // may carry a newer one than the stored one, if it came
+                // through a cache that doesn't store it (event-focused,
+                // pinned).
+                if let Some(bundled) = BundledThreadSummary::from_root(&event) {
+                    thread_info.consider_bundled_summary(bundled);
                 }
+                Some(thread_info.summary())
             }
             // Ah, the thread summary data don't exist in a `ThreadInfo` in the Event Cache.
             // Theoretically, the Event Cache **MUST HAVE** populated the `ThreadInfo`, but, in case

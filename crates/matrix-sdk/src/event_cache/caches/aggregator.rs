@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: a redaction of a thread reply goes to
+// the thread the room noted for it before redacting it, before any search of
+// the thread caches in memory.
+
 use std::collections::{BTreeMap, HashMap};
 
 use matrix_sdk_base::{
@@ -160,12 +164,25 @@ pub async fn aggregate_timeline_and_read_receipts_for_threads<'sync, 'state>(
                     // apply the redaction in the thread too. No other choice
                     // than doing a full search…
 
-                    let mut associated_thread_root = None;
+                    // The room noted the thread root of a thread reply while
+                    // redacting it, before the relation went away. A reply's
+                    // thread never changes, so the note is the answer, also
+                    // for a thread no cache in memory holds (one nobody opened
+                    // since a restart).
+                    let mut associated_thread_root = maybe_room.as_ref().and_then(|room| {
+                        room.thread_root_of_redacted_reply(&redaction_target).cloned()
+                    });
 
-                    for thread in existing_threads.values() {
-                        if thread.find_event(&redaction_target).await?.is_some() {
-                            associated_thread_root = Some(thread.thread_id.clone());
-                            break;
+                    // Without a note, search the thread caches in memory. A
+                    // thread cache finds any event of the room in the store,
+                    // so this takes the first one: right only when one holds
+                    // the event in memory, which is why the note comes first.
+                    if associated_thread_root.is_none() {
+                        for thread in existing_threads.values() {
+                            if thread.find_event(&redaction_target).await?.is_some() {
+                                associated_thread_root = Some(thread.thread_id.clone());
+                                break;
+                            }
                         }
                     }
 

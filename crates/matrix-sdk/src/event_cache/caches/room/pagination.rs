@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Modified by the Spiral authors, 2026: post-processing is told the events come
+// from the server, so a thread root served without a summary forgets its own.
+
 //! The [`RoomPagination`] type makes it possible to paginate a
 //! [`RoomEventCache`].
 //!
@@ -49,6 +52,7 @@ use super::{
         read_receipts::{contains_a_receipt_target, unresolved_receipt_targets},
     },
     RoomEventCacheInner, RoomEventCacheUpdate,
+    state::UpsertedFrom,
 };
 use crate::{event_cache::caches::pagination::SharedPaginationStatus, room::MessagesOptions};
 
@@ -449,7 +453,13 @@ impl PaginatedCache for Arc<RoomEventCacheInner> {
         let receipt_event = None;
 
         // Post-process newly inserted events.
-        state.post_process_upserted_events(topo_ordered_events.iter(), receipt_event).await?;
+        state
+            .post_process_upserted_events(
+                topo_ordered_events.iter(),
+                receipt_event,
+                UpsertedFrom::ServerWithRelations,
+            )
+            .await?;
 
         let timeline_event_diffs = state.room_linked_chunk_mut().updates_as_vector_diffs();
 

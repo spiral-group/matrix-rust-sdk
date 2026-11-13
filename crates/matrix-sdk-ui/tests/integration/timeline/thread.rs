@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Modified by the Spiral authors, 2026: tests that a thread root keeps its
-// bundled summary until the thread's replies are counted.
+// bundled summary until the whole thread is counted, after a restart too.
 
 use std::{assert_matches, ops::Not as _, time::Duration};
 
@@ -2582,7 +2582,7 @@ async fn test_a_cleared_event_cache_does_not_hide_a_bundled_summary() {
     let f = EventFactory::new().room(room_id).sender(User::Alice);
     let root = event_id!("$root");
 
-    // A reply syncs into an opened thread: the summary is computed.
+    // A reply syncs into an opened thread: it is counted.
     let _thread = open_thread(&room, root).await;
     server
         .sync_room(
@@ -2596,7 +2596,6 @@ async fn test_a_cleared_event_cache_does_not_hide_a_bundled_summary() {
         .await;
     let thread_info =
         client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
-    assert!(thread_info.summary_computed);
     assert_eq!(thread_info.number_of_replies, 1);
 
     // Everything is forgotten (an ignored user, a cache clear).
@@ -2651,4 +2650,907 @@ async fn test_a_whole_thread_pagination_replaces_a_stale_bundled_summary() {
     assert!(thread.paginate_backwards(20).await.unwrap(), "the whole thread is loaded");
 
     wait_for_root_thread_summary(&timeline, root, (0, None)).await;
+}
+
+/// Stores a test can hand to a second client, to restart the app.
+fn shared_store_config() -> matrix_sdk::store::StoreConfig {
+    matrix_sdk::store::StoreConfig::new(
+        matrix_sdk::cross_process_lock::CrossProcessLockConfig::multi_process("thread-summary"),
+    )
+    .state_store(matrix_sdk_base::store::MemoryStore::new())
+    .event_cache_store(std::sync::Arc::new(matrix_sdk_base::event_cache::store::MemoryStore::new()))
+}
+
+async fn client_with_threading_support_and_stores(
+    server: &MatrixMockServer,
+    store_config: matrix_sdk::store::StoreConfig,
+) -> Client {
+    server
+        .client_builder()
+        .on_builder(|builder| {
+            builder
+                .with_threading_support(ThreadingSupport::Enabled { with_subscriptions: false })
+                .store_config(store_config)
+        })
+        .build()
+        .await
+}
+
+/// An old thread opened on a device that has none of its replies, then the
+/// app restarts: the root comes back from the store, which keeps no bundled
+/// relations, and the thread's `ThreadInfo` still counts zero replies. The
+/// root must show the server's summary, not an empty one.
+#[async_test]
+async fn test_an_opened_old_thread_keeps_its_bundled_summary_after_a_restart() {
+    let server = MatrixMockServer::new().await;
+    let store_config = shared_store_config();
+    let client = client_with_threading_support_and_stores(&server, store_config.clone()).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("an old thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("the last one!").event_id(event_id!("$latest")).in_thread(root, root).into(),
+        42,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let thread = open_thread(&room, root).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (42, Some("the last one!"))).await;
+
+    drop((timeline, thread, room));
+    drop(client);
+    let client = client_with_threading_support_and_stores(&server, store_config).await;
+    let room = client.get_room(room_id).expect("the room is in the state store");
+    let timeline = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&timeline, root, (42, Some("the last one!"))).await;
+}
+
+/// A thread root never opened on this device, after a restart: it comes
+/// back from the store without its bundled relations, and must still show
+/// the server's summary.
+#[async_test]
+async fn test_a_thread_root_keeps_its_bundled_summary_after_a_restart() {
+    let server = MatrixMockServer::new().await;
+    let store_config = shared_store_config();
+    let client = client_with_threading_support_and_stores(&server, store_config.clone()).await;
+    let room_id = room_id!("!a:b.c");
+    server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 3").event_id(event_id!("$3")).in_thread(root, event_id!("$2")).into(),
+        3,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+
+    drop(client);
+    let client = client_with_threading_support_and_stores(&server, store_config).await;
+    let room = client.get_room(room_id).expect("the room is in the state store");
+    let timeline = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&timeline, root, (3, Some("reply 3"))).await;
+}
+
+/// A reply arriving over sync in a long thread this device has none of:
+/// one reply on the device is no count of the thread, but it is newer than
+/// the server's summary, so the root shows the server's count plus that one,
+/// with the new reply as the latest one.
+#[async_test]
+async fn test_a_reply_over_sync_adds_to_the_bundled_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let event = f.text_msg("an old thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 42").event_id(event_id!("$42")).in_thread(root, event_id!("$41")).into(),
+        42,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (42, Some("reply 42"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("reply 43").event_id(event_id!("$43")).in_thread(root, event_id!("$42")),
+            ),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (43, Some("reply 43"))).await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(root_thread_summary(&timeline, root).await, Some((43, Some("reply 43".to_owned()))));
+}
+
+/// The only reply of a thread is redacted while the thread isn't counted
+/// whole: the summary the server bundled with the root counted it, so it no
+/// longer may, and the root must not keep showing a reply.
+#[async_test]
+async fn test_a_redacted_reply_leaves_the_bundled_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+    let reply = event_id!("$r1");
+
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 1").event_id(reply).in_thread(root, root).into(),
+        1,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let _thread = open_thread(&room, root).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (1, Some("reply 1"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.redaction(reply).event_id(event_id!("$redaction"))),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (0, None)).await;
+}
+
+/// A root the server serves again without a thread summary, where it
+/// bundles relations (a limited sync, a back-pagination), has no thread any
+/// more (every reply gone): the summary stored from an earlier copy must not
+/// outlive it.
+#[async_test]
+async fn test_a_root_served_without_a_thread_summary_forgets_the_stored_one() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // The bundled latest event carries no thread relation, so the event
+    // cache, which stores it, does not count it as a reply.
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 2").event_id(event_id!("$2")).into(),
+        2,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("gap")
+                .add_timeline_event(f.text_msg("a thread").event_id(root))
+                .add_timeline_event(f.text_msg("something else").event_id(event_id!("$other"))),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (0, None)).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.bundled_summary, None);
+}
+
+/// A thread counted whole, then a limited sync leaves a gap in it: the
+/// replies in the gap are not on the device, so its count is partial again
+/// and the larger summary the server bundles with the root wins.
+#[async_test]
+async fn test_a_gap_in_a_whole_thread_makes_its_count_partial() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let reply = |n: u32| {
+        f.text_msg(format!("reply {n}"))
+            .event_id(&ruma::EventId::parse(format!("${n}")).unwrap())
+            .in_thread(root, root)
+    };
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("a thread").event_id(root))
+                .add_timeline_event(reply(1))
+                .add_timeline_event(reply(2)),
+        )
+        .await;
+
+    // The thread is counted whole: two replies.
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default()
+            .events(vec![reply(2).into_raw(), reply(1).into_raw()]))
+        .mock_once()
+        .mount()
+        .await;
+    let thread = open_thread(&room, root).await;
+    assert!(thread.paginate_backwards(20).await.unwrap(), "the whole thread is loaded");
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+
+    // A limited sync skips replies 3 and 4, and brings the root again with
+    // the server's summary of five replies, and reply 5.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("gap")
+                .add_timeline_event(
+                    f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+                        reply(5).into(),
+                        5,
+                        false,
+                    ),
+                )
+                .add_timeline_event(reply(5)),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (5, Some("reply 5"))).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert!(!thread_info.all_replies_counted);
+}
+
+/// A thread opened before its root arrives holds its `ThreadInfo` in memory
+/// without the summary the room then stores for the root. The thread's next
+/// write (a reply here) must not put that older `ThreadInfo` back over the
+/// stored summary: after a restart, the root still shows it.
+#[async_test]
+async fn test_a_thread_write_keeps_the_bundled_summary_stored_meanwhile() {
+    let server = MatrixMockServer::new().await;
+    let store_config = shared_store_config();
+    let client = client_with_threading_support_and_stores(&server, store_config.clone()).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let thread = open_thread(&room, root).await;
+
+    let event = f.text_msg("an old thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 42").event_id(event_id!("$42")).in_thread(root, event_id!("$41")).into(),
+        42,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("reply 43").event_id(event_id!("$43")).in_thread(root, event_id!("$42")),
+            ),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (43, Some("reply 43"))).await;
+
+    drop((timeline, thread, room));
+    drop(client);
+    let client = client_with_threading_support_and_stores(&server, store_config).await;
+    let room = client.get_room(room_id).expect("the room is in the state store");
+    let timeline = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&timeline, root, (43, Some("reply 43"))).await;
+}
+
+/// Wait until the root shows `expected` replies, whatever the latest one.
+async fn wait_for_root_reply_count(
+    timeline: &matrix_sdk_ui::Timeline,
+    root: &ruma::EventId,
+    expected: u32,
+) {
+    let mut last = None;
+    for _ in 0..200 {
+        last = root_thread_summary(timeline, root).await;
+        if last.as_ref().is_some_and(|(count, _)| *count == expected) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the thread root shows {last:?}, expected {expected} replies");
+}
+
+/// A reply in `root`'s thread, sent at `ts`.
+fn reply_at(
+    f: &EventFactory,
+    root: &ruma::EventId,
+    n: u32,
+    ts: u64,
+) -> matrix_sdk_test::event_factory::EventBuilder<RoomMessageEventContent> {
+    f.text_msg(format!("reply {n}"))
+        .event_id(&ruma::EventId::parse(format!("$r{n}")).unwrap())
+        .in_thread(root, root)
+        .server_ts(ts)
+}
+
+/// The root, sent before its replies, comes in one batch with them and
+/// with the server's summary of those very replies: none is newer than the
+/// summary's latest reply, so the count is the server's, not more.
+#[async_test]
+async fn test_a_root_and_its_replies_in_one_batch_count_each_reply_once() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 3, 4000).into(), 3, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000))
+                .add_timeline_event(reply_at(&f, root, 3, 4000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&timeline, root, (3, Some("reply 3"))).await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(root_thread_summary(&timeline, root).await, Some((3, Some("reply 3".to_owned()))));
+}
+
+/// A reply the server's summary counted, received over sync and then
+/// redacted, comes out of that summary's count.
+#[async_test]
+async fn test_redacting_a_reply_from_sync_lowers_the_bundled_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // Reply 3 is only in the server's summary.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 3, 4000).into(), 3, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 3).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.redaction(event_id!("$r1")).event_id(event_id!("$redaction")).server_ts(5000),
+            ),
+        )
+        .await;
+
+    // Reply 3, only in the server's summary, is still the latest.
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 3"))).await;
+}
+
+/// A thread cache that holds the root's bundled summary in memory must not
+/// write it back after the server served the root without one: the next
+/// reply finds the summary forgotten, and the count is the replies here.
+#[async_test]
+async fn test_a_forgotten_bundled_summary_stays_forgotten_in_an_open_thread() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    let _thread = open_thread(&room, root).await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("a thread").event_id(root).server_ts(1000).with_bundled_thread_summary(
+                    reply_at(&f, root, 5, 5000).into(),
+                    5,
+                    false,
+                ),
+            ),
+        )
+        .await;
+    // A reply: the thread cache writes its `ThreadInfo`, the bundle with it.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(reply_at(&f, root, 6, 6000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 6).await;
+
+    // The server serves the root again, without a thread summary.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("gap")
+                .add_timeline_event(f.text_msg("a thread").event_id(root).server_ts(1000))
+                .add_timeline_event(f.text_msg("something else").event_id(event_id!("$other"))),
+        )
+        .await;
+    // Another reply: the thread cache writes its `ThreadInfo` again.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(reply_at(&f, root, 7, 7000)),
+        )
+        .await;
+
+    // Replies 5 (stored with the first root), 6 and 7.
+    wait_for_root_reply_count(&timeline, root, 3).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.bundled_summary, None);
+}
+
+/// A thread counted whole, then the server serves its root with a summary
+/// counting more replies than the device has: some came in without this
+/// device seeing them, so the count is partial again and the server's
+/// wins, also after the thread cache's next write.
+#[async_test]
+async fn test_a_larger_fresh_bundled_summary_reopens_a_whole_thread_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("a thread").event_id(root).server_ts(1000))
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000)),
+        )
+        .await;
+    server
+        .mock_room_relations()
+        .match_target_event(root.to_owned())
+        .ok(RoomRelationsResponseTemplate::default().events(vec![
+            reply_at(&f, root, 2, 3000).into_raw(),
+            reply_at(&f, root, 1, 2000).into_raw(),
+        ]))
+        .mock_once()
+        .mount()
+        .await;
+    let thread = open_thread(&room, root).await;
+    assert!(thread.paginate_backwards(20).await.unwrap(), "the whole thread is loaded");
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 2).await;
+
+    // The root again, with the server's summary of five replies; nothing
+    // in the thread itself comes with it.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .set_timeline_limited()
+                .set_timeline_prev_batch("gap")
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 5, 5000).into(), 5, false),
+                )
+                .add_timeline_event(f.text_msg("something else").event_id(event_id!("$other"))),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    // The server's latest reply is newer than any here: it is the preview.
+    wait_for_root_thread_summary(&timeline, root, (5, Some("reply 5"))).await;
+
+    // A reply: the thread cache writes its `ThreadInfo`, and must not mark
+    // the count whole again.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(reply_at(&f, root, 6, 6000)),
+        )
+        .await;
+    wait_for_root_thread_summary(&timeline, root, (6, Some("reply 6"))).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert!(!thread_info.all_replies_counted);
+}
+
+/// A live sync that isn't limited carries no bundled relations (Synapse
+/// bundles them only with a limited timeline): a root in it without a
+/// thread summary says nothing about its thread, and the stored summary
+/// stays.
+#[async_test]
+async fn test_a_root_in_a_live_sync_keeps_the_stored_bundled_summary() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // The bundled latest event carries no thread relation, so the event
+    // cache, which stores it, does not count it as a reply.
+    let event = f.text_msg("a thread").event_id(root).with_bundled_thread_summary(
+        f.text_msg("reply 2").event_id(event_id!("$2")).into(),
+        2,
+        false,
+    );
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(event)).await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(f.text_msg("a thread").event_id(root))
+                .add_timeline_event(f.text_msg("something else").event_id(event_id!("$other"))),
+        )
+        .await;
+
+    sleep(Duration::from_millis(100)).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.bundled_summary.map(|bundled| bundled.num_replies), Some(2));
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+}
+
+/// A redaction that can't be applied (it isn't canonical JSON: a float in
+/// its content) leaves the reply in place, so the reply stays in the
+/// server's count too.
+#[async_test]
+async fn test_a_redaction_that_cannot_apply_leaves_the_bundled_count() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    // Reply 4 is only in the server's summary.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 4, 5000).into(), 4, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 4).await;
+
+    let redaction: ruma::serde::Raw<AnySyncTimelineEvent> =
+        f.redaction(event_id!("$r1")).event_id(event_id!("$redaction")).server_ts(6000).into_raw();
+    let mut redaction = serde_json::to_value(&redaction).unwrap();
+    redaction["content"]["not_canonical"] = serde_json::json!(1.5);
+    let redaction: ruma::serde::Raw<AnySyncTimelineEvent> =
+        ruma::serde::Raw::new(&redaction).unwrap().cast_unchecked();
+    server.sync_room(&client, JoinedRoomBuilder::new(room_id).add_timeline_event(redaction)).await;
+
+    sleep(Duration::from_millis(100)).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.bundled_summary.map(|bundled| bundled.num_replies), Some(4));
+    wait_for_root_reply_count(&timeline, root, 4).await;
+}
+
+/// The server's latest reply, received over sync too, is redacted: the
+/// preview moves to the latest reply left, not to the redacted one.
+#[async_test]
+async fn test_redacting_the_bundled_latest_reply_moves_the_preview() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 3, 4000).into(), 3, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000))
+                .add_timeline_event(reply_at(&f, root, 3, 4000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (3, Some("reply 3"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.redaction(event_id!("$r3")).event_id(event_id!("$redaction")).server_ts(5000),
+            ),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+}
+
+/// The server's latest reply is also the latest reply here, and it is
+/// edited: the preview is the edited reply, not the text from before the
+/// edit.
+#[async_test]
+async fn test_an_edit_of_the_bundled_latest_reply_shows_in_the_preview() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 2, 3000).into(), 2, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("* edited reply 2")
+                    .edit(
+                        event_id!("$r2"),
+                        RoomMessageEventContentWithoutRelation::text_plain("edited reply 2"),
+                    )
+                    .event_id(event_id!("$edit"))
+                    .server_ts(4000),
+            ),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (2, Some("edited reply 2"))).await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        root_thread_summary(&timeline, root).await,
+        Some((2, Some("edited reply 2".to_owned())))
+    );
+}
+
+/// A reply the server's summary counted is redacted, and then the room's
+/// timeline is built again while the room cache still holds the root with
+/// that summary in memory: the root shows the count after the redaction,
+/// not the in-memory summary from before it.
+#[async_test]
+async fn test_a_rebuilt_timeline_keeps_the_count_after_a_redaction() {
+    let server = MatrixMockServer::new().await;
+    let client = client_with_threading_support(&server).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 2, 3000).into(), 2, false),
+                )
+                .add_timeline_event(reply_at(&f, root, 1, 2000))
+                .add_timeline_event(reply_at(&f, root, 2, 3000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.redaction(event_id!("$r2")).event_id(event_id!("$redaction")).server_ts(5000),
+            ),
+        )
+        .await;
+    wait_for_root_thread_summary(&timeline, root, (1, Some("reply 1"))).await;
+
+    // The first timeline keeps the room cache, and the root in it, alive.
+    let rebuilt = room.timeline().await.unwrap();
+
+    wait_for_root_thread_summary(&rebuilt, root, (1, Some("reply 1"))).await;
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(root_thread_summary(&rebuilt, root).await, Some((1, Some("reply 1".to_owned()))));
+}
+
+/// A reply newer than the server's summary arrives over sync, the app
+/// restarts, and the reply is redacted while no thread cache is in memory:
+/// the stored count, the live timeline and a rebuilt one all drop it.
+#[async_test]
+async fn test_a_newer_reply_redacted_after_a_restart_leaves_the_count() {
+    let server = MatrixMockServer::new().await;
+    let store_config = shared_store_config();
+    let client = client_with_threading_support_and_stores(&server, store_config.clone()).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("a thread").event_id(root).server_ts(1000).with_bundled_thread_summary(
+                    reply_at(&f, root, 2, 3000).into(),
+                    2,
+                    false,
+                ),
+            ),
+        )
+        .await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(reply_at(&f, root, 3, 4000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (3, Some("reply 3"))).await;
+
+    drop((timeline, room));
+    drop(client);
+    let client = client_with_threading_support_and_stores(&server, store_config).await;
+    let room = client.get_room(room_id).expect("the room is in the state store");
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 3).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.redaction(event_id!("$r3")).event_id(event_id!("$redaction")).server_ts(5000),
+            ),
+        )
+        .await;
+
+    // Reply 2, the server's latest, is the latest left.
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.summary().num_replies, 2);
+    let rebuilt = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&rebuilt, root, (2, Some("reply 2"))).await;
+}
+
+/// The same as the test above, but another thread of the room has a cache in
+/// memory when the reply is redacted. A thread cache finds any event of the
+/// room in the store, so the redaction must still go to the reply's own
+/// thread, not to the other one.
+#[async_test]
+async fn test_a_newer_reply_redacted_after_a_restart_leaves_the_count_beside_another_thread() {
+    let server = MatrixMockServer::new().await;
+    let store_config = shared_store_config();
+    let client = client_with_threading_support_and_stores(&server, store_config.clone()).await;
+    let room_id = room_id!("!a:b.c");
+    let room = server.sync_joined_room(&client, room_id).await;
+    let f = EventFactory::new().room(room_id).sender(User::Alice);
+    let root = event_id!("$root");
+    let other = event_id!("$other");
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id)
+                .add_timeline_event(
+                    f.text_msg("a thread")
+                        .event_id(root)
+                        .server_ts(1000)
+                        .with_bundled_thread_summary(reply_at(&f, root, 2, 3000).into(), 2, false),
+                )
+                .add_timeline_event(f.text_msg("another thread").event_id(other).server_ts(1500)),
+        )
+        .await;
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(reply_at(&f, root, 3, 4000)),
+        )
+        .await;
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&timeline, root, (3, Some("reply 3"))).await;
+
+    drop((timeline, room));
+    drop(client);
+    let client = client_with_threading_support_and_stores(&server, store_config).await;
+    let room = client.get_room(room_id).expect("the room is in the state store");
+    let timeline = room.timeline().await.unwrap();
+    wait_for_root_reply_count(&timeline, root, 3).await;
+
+    // A reply in the other thread gives it a thread cache.
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.text_msg("other reply")
+                    .event_id(event_id!("$other_reply"))
+                    .in_thread(other, other)
+                    .server_ts(4500),
+            ),
+        )
+        .await;
+    wait_for_root_reply_count(&timeline, other, 1).await;
+
+    server
+        .sync_room(
+            &client,
+            JoinedRoomBuilder::new(room_id).add_timeline_event(
+                f.redaction(event_id!("$r3")).event_id(event_id!("$redaction")).server_ts(5000),
+            ),
+        )
+        .await;
+
+    wait_for_root_thread_summary(&timeline, root, (2, Some("reply 2"))).await;
+    let thread_info =
+        client.event_cache().unwrap().thread_info(room_id, root).await.unwrap().unwrap();
+    assert_eq!(thread_info.summary().num_replies, 2);
+    let rebuilt = room.timeline().await.unwrap();
+    wait_for_root_thread_summary(&rebuilt, root, (2, Some("reply 2"))).await;
 }

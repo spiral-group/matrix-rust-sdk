@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Modified by the Spiral authors, 2026: the thread cache holds its room's
-// update sender, and update_thread_summary returns nothing while the summary is
-// not computed.
+// update sender, and update_thread_summary announces ThreadInfo::summary, and
+// nothing while no summary is known.
 
 //! Threads-related data structures.
 
@@ -320,17 +320,20 @@ impl ThreadEventCache {
     /// Update the [`ThreadSummary`] for this thread, and return a copy of it
     /// if it says something about the thread.
     ///
-    /// `None` while the summary is not computed (see
-    /// `ThreadInfo::summary_computed`): no reply is on this device yet, and
-    /// its zero must not replace the summary bundled with the thread root,
-    /// so nothing is announced.
+    /// `None` while nothing is known (see `ThreadInfo::summary_is_known`): no
+    /// reply on this device and no bundled summary, a zero that must not
+    /// replace a summary the reader got with the thread root, so nothing is
+    /// announced. A summary that was known and is no more (its only reply
+    /// redacted) is announced, so the zero replaces it.
     pub(in super::super) async fn update_thread_summary(&self) -> Result<Option<ThreadSummary>> {
         let mut state = self.inner.state.write().await?;
 
-        let thread_summary = state.update_thread_summary().await?;
-        if !state.state.thread_info.read().await.summary_computed {
+        let was_known = state.state.thread_info.read().await.summary_is_known();
+        let thread_info = state.update_thread_summary().await?;
+        if !was_known && !thread_info.summary_is_known() {
             return Ok(None);
         }
+        let thread_summary = thread_info.summary();
 
         state
             .update_sender

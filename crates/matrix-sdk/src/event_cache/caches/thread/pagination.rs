@@ -426,19 +426,17 @@ impl PaginatedCache for ThreadEventCacheWrapper {
         // short has seen only part of the thread: its count would be lower
         // than the one the server bundled with the root, so it is left alone.
         if reached_start {
-            let (previous_summary, was_computed) = {
-                let thread_info = state.state.thread_info.read().await;
-                (
-                    (thread_info.number_of_replies, thread_info.latest_event.clone()),
-                    thread_info.summary_computed,
-                )
-            };
-            let thread_summary = state.recount_thread_summary(Recount::WholeThread).await?;
-            // Until now the root showed the summary bundled with it, not the
-            // stored one: an unchanged stored count still changes the screen.
-            if !was_computed
-                || previous_summary
-                    != (thread_summary.num_replies, thread_summary.latest_reply.clone())
+            let mut previous_thread_info = state.state.thread_info.read().await.clone();
+            let thread_info = state.recount_thread_summary(Recount::WholeThread).await?;
+            let thread_summary = thread_info.summary();
+            // What the root showed until now: the summary announced or read
+            // before, from the replies counted then and the bundled summary
+            // stored by now (the room cache may have stored a newer one since
+            // this thread last wrote its `ThreadInfo`). A larger bundled count
+            // the whole thread doesn't reach changes the screen too.
+            previous_thread_info.bundled_summary = thread_info.bundled_summary;
+            if !previous_thread_info.summary_is_known()
+                || previous_thread_info.summary() != thread_summary
             {
                 state
                     .update_sender

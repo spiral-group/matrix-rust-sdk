@@ -13,7 +13,9 @@
 // limitations under the License.
 
 // Modified by the Spiral authors, 2026: a recount says what it is worth
-// (Recount) and sets ThreadInfo::summary_computed together with the count.
+// (Recount) and sets ThreadInfo::all_replies_counted together with the count,
+// which a sync leaving a gap in the thread clears; a ThreadInfo write keeps
+// the bundled summary and the flag as the room cache stored them.
 
 use std::iter::empty;
 
@@ -39,7 +41,7 @@ use ruma::{
     room_version_rules::RoomVersionRules,
 };
 use tokio::sync::broadcast::Sender;
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 
 #[cfg(feature = "e2e-encryption")]
 use super::super::super::redecryptor::MaybeResolvedEvent;
@@ -114,17 +116,18 @@ pub struct ThreadEventCacheState {
 }
 
 /// What a recount of a thread's replies is worth, for
-/// [`ThreadInfo::summary_computed`].
+/// [`ThreadInfo::all_replies_counted`].
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Recount {
-    /// The replies on this device: a count once it finds any, and a
-    /// computed summary stays computed.
+    /// The replies on this device, after new ones arrived: a whole-thread
+    /// count stays whole (a sync that leaves a gap in the thread makes it
+    /// partial before, see `handle_sync`), a partial one stays partial
+    /// however many replies it finds.
     Local,
-    /// The whole thread is loaded (a back-pagination reached the root): even
-    /// zero is a count.
+    /// The whole thread is loaded (a back-pagination reached the root): the
+    /// count is the thread's, even zero.
     WholeThread,
-    /// The events were forgotten: only replies found from now on make a
-    /// count.
+    /// The events were forgotten: the count is partial again.
     FromScratch,
 }
 
@@ -399,15 +402,15 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         self.state.shrink_to_last_reloaded_chunk(&self.store).await?;
 
-        // Forgetting every event forgets what the count was computed from: a
-        // zero now is not a count until replies are back (the stored
-        // `ThreadInfo` survives a cleared store, and a computed zero would
-        // hide every bundled summary received again).
+        // Forgetting every event forgets what the count was computed from:
+        // it is partial again (the stored `ThreadInfo` survives a cleared
+        // store, and a whole-thread zero would hide every bundled summary
+        // received again).
         let recount = match preprocessing {
             ReloadPreprocessing::ForgetAll => Recount::FromScratch,
             ReloadPreprocessing::None => Recount::Local,
         };
-        let thread_summary = self.recount_thread_summary(recount).await?;
+        let thread_summary = self.recount_thread_summary(recount).await?.summary();
 
         Ok((self.thread_linked_chunk_mut().updates_as_vector_diffs(), thread_summary))
     }
@@ -481,6 +484,14 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
             //
             // We must do this _after_ persisting these events to storage.
             self.state.shrink_to_last_reloaded_chunk(&self.store).await?;
+
+            // The replies in the gap aren't on this device: a whole-thread
+            // count is partial again, until a back-pagination reaches the
+            // root anew.
+            if self.state.thread_info.read().await.all_replies_counted {
+                self.update_thread_info(|thread_info| thread_info.all_replies_counted = false)
+                    .await?;
+            }
         }
 
         let timeline_event_diffs = self.state.thread_linked_chunk.updates_as_vector_diffs();
@@ -563,29 +574,32 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         Ok(())
     }
 
-    /// Update the [`ThreadSummary`] for this thread, and return a copy of it.
-    pub(super) async fn update_thread_summary(&mut self) -> Result<ThreadSummary> {
+    /// Update the [`ThreadSummary`] for this thread, and return the
+    /// [`ThreadInfo`] it is now part of.
+    pub(super) async fn update_thread_summary(&mut self) -> Result<ThreadInfo> {
         self.recount_thread_summary(Recount::Local).await
     }
 
-    /// Recount the [`ThreadSummary`] for this thread, store it in one
-    /// [`ThreadInfo`] write together with what the count is worth (see
-    /// [`Recount`]), and return a copy of it.
-    pub(super) async fn recount_thread_summary(
-        &mut self,
-        recount: Recount,
-    ) -> Result<ThreadSummary> {
+    /// Recount the replies of this thread, store the count in one
+    /// [`ThreadInfo`] write together with what it is worth (see [`Recount`]),
+    /// and return a copy of the [`ThreadInfo`]: its
+    /// [`ThreadInfo::summary`] is what to show for the thread.
+    pub(super) async fn recount_thread_summary(&mut self, recount: Recount) -> Result<ThreadInfo> {
         // Read the latest number of thread replies from the store.
         //
         // Implementation note: since this is based on the `m.relates_to`
         // field, and that field can only be present on room messages, we
         // don't have to worry about filtering out aggregation events (like
         // reactions/edits/etc.). Pretty neat, huh?
-        let num_replies = self
+        let replies = self
             .store
             .find_event_relations(&self.room_id, &self.thread_id, Some(&[RelationType::Thread]))
-            .await?
-            .len();
+            .await?;
+        let num_replies = replies.len();
+        // When each reply was sent, to count the ones newer than the summary
+        // the server bundled with the root.
+        let reply_timestamps =
+            replies.iter().filter_map(|(reply, _)| reply.timestamp()).collect::<Vec<_>>();
 
         // Find the latest event ID, if and only if we consider there is at
         // least 1 reply.
@@ -593,6 +607,10 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
         // This last check is important: all in-thread events can be redacted,
         // so `num_replies` would be zero, and in that case, we don't want to
         // spend time trying to find the `latest_event_id`.
+        // The latest reply itself, before an edit of it takes its place below:
+        // to tell whether it is the latest reply the server bundled.
+        let mut latest_reply_id = None;
+
         let latest_event_id = if num_replies > 0 {
             // Find the last non-edit, non-redaction, non-redacted event.
             //
@@ -613,6 +631,7 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
                     .is_break()
                 })
                 .and_then(|(_position, event)| event.event_id().map(ToOwned::to_owned));
+            latest_reply_id.clone_from(&latest_event_id);
 
             // If there's an edit to the latest event in the thread, use the
             // latest edit event ID as the latest event ID for the thread
@@ -652,24 +671,26 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
 
         let thread_summary = ThreadSummary::new(latest_event_id, num_replies);
 
-        // A zero from nothing on this device is not a count (see
-        // `ThreadInfo::summary_computed`): an old thread opened before any of
-        // its replies is here must keep its bundled summary. Once computed,
-        // a zero is real (every reply redacted, say).
-        let counted = thread_summary.num_replies > 0;
-
+        // Replies found on this device are a lower bound until the thread was
+        // paginated to its root (see `ThreadInfo::all_replies_counted`): an
+        // old thread opened before any of its replies is here, or with only
+        // its newest page or a reply from sync, keeps the larger summary the
+        // server bundled with its root. Once whole, a lower count is real
+        // (replies redacted, say).
         self.update_thread_info(|thread_info| {
-            thread_info.latest_event = thread_summary.latest_reply.clone();
+            thread_info.latest_event = thread_summary.latest_reply;
             thread_info.number_of_replies = thread_summary.num_replies;
-            thread_info.summary_computed = match recount {
-                Recount::Local => thread_info.summary_computed || counted,
+            thread_info.all_replies_counted = match recount {
+                Recount::Local => thread_info.all_replies_counted,
                 Recount::WholeThread => true,
-                Recount::FromScratch => counted,
+                Recount::FromScratch => false,
             };
+            thread_info
+                .compare_local_replies_with_bundled(&reply_timestamps, latest_reply_id.as_deref());
         })
         .await?;
 
-        Ok(thread_summary)
+        Ok(self.state.thread_info.read().await.clone())
     }
 
     /// Update the [`ThreadInfo`].
@@ -679,9 +700,42 @@ impl<'a> StateLockWriteGuard<'a, ThreadEventCacheState> {
     where
         F: FnOnce(&mut ThreadInfo),
     {
+        // The room cache stores the summary the server bundles with a thread
+        // root straight into the stored `ThreadInfo` (the root is a room
+        // event), forgets it there, and makes a whole-thread count partial
+        // when a fresh summary counts more: take both over as they are
+        // stored, none included, so this write doesn't put back older ones.
+        // Best effort: if they can't be read, the write goes ahead with the
+        // ones held in memory, rather than failing over a display hint.
+        let stored = match self
+            .store
+            .load_thread_info(&self.state.room_id, &self.state.thread_id, false)
+            .await
+        {
+            Ok(stored) => Some((
+                stored.as_ref().and_then(|stored| stored.bundled_summary.clone()),
+                stored.is_some_and(|stored| stored.all_replies_counted),
+            )),
+            Err(error) => {
+                warn!(
+                    room_id = ?self.state.room_id,
+                    thread_id = ?self.state.thread_id,
+                    ?error,
+                    "Failed to read the stored bundled thread summary; keeping the one in memory"
+                );
+                None
+            }
+        };
+
         let mut thread_info = self.state.thread_info.write().await;
 
-        ObservableWriteGuard::update(&mut thread_info, update);
+        ObservableWriteGuard::update(&mut thread_info, |thread_info| {
+            if let Some((bundled_summary, all_replies_counted)) = stored {
+                thread_info.bundled_summary = bundled_summary;
+                thread_info.all_replies_counted = all_replies_counted;
+            }
+            update(thread_info);
+        });
 
         Ok(self
             .store

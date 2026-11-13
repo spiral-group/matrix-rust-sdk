@@ -12,18 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::iter::empty;
+// Modified by the Spiral authors, 2026: the summary the server bundles with a
+// thread root is stored in the thread's ThreadInfo, so it survives the
+// stripping of bundled relations and a restart; it is forgotten when the
+// server serves the root without one where it bundles relations, and a
+// redacted reply leaves its count and its thread is noted for the aggregator.
+
+use std::{collections::HashMap, iter::empty};
 
 use eyeball::SharedObservable;
 use eyeball_im::VectorDiff;
 use matrix_sdk_base::{
     RoomInfoNotableUpdateReasons, apply_redaction,
-    event_cache::{Event, Gap, store::EventCacheStoreLockGuard},
+    event_cache::{
+        Event, Gap,
+        store::EventCacheStoreLockGuard,
+        thread::{BundledThreadSummary, ThreadInfo},
+    },
     linked_chunk::{
         ChunkContent, ChunkIdentifierGenerator, LinkedChunkId, OwnedLinkedChunkId, Position,
         Update, lazy_loader,
     },
-    serde_helpers::extract_redaction_target,
+    serde_helpers::{extract_redaction_target, extract_relation, extract_thread_root},
     sync::Timeline,
 };
 use matrix_sdk_common::executor::spawn;
@@ -110,6 +120,18 @@ pub struct RoomEventCacheState {
 
     /// A handle to the shared back-pagination queue.
     back_pagination_queue: Option<BackPaginationQueue>,
+
+    /// The thread root of each thread reply this cache redacted, read before
+    /// the redaction took the reply's relation away: the aggregator routes
+    /// a redaction to that thread, even when no thread cache holds the reply
+    /// (see `aggregator`).
+    ///
+    /// Cleared when a sync starts, so it holds the redactions of that sync
+    /// for the aggregator that runs after it. Room back-pagination and
+    /// redecryption (`replace_in_memory_utds`) also write it, and those notes
+    /// stay until the next sync clears them; only a sync's aggregator reads
+    /// them.
+    thread_roots_of_redacted_replies: HashMap<OwnedEventId, OwnedEventId>,
 }
 
 impl RoomEventCacheState {
@@ -196,7 +218,14 @@ impl RoomEventCacheState {
             waited_for_initial_prev_token: false,
             subscribers_handle: Default::default(),
             back_pagination_queue,
+            thread_roots_of_redacted_replies: HashMap::new(),
         })
+    }
+
+    /// The thread root of `reply`, if this cache redacted it while it was a
+    /// thread reply, since the latest sync started.
+    pub fn thread_root_of_redacted_reply(&self, reply: &EventId) -> Option<&OwnedEventId> {
+        self.thread_roots_of_redacted_replies.get(reply)
     }
 
     /// Return a read-only reference to the underlying room linked chunk.
@@ -317,6 +346,22 @@ impl<'a> StateLockReadGuard<'a, RoomEventCacheState> {
     pub fn is_dirty(&self) -> bool {
         EventCacheStoreLockGuard::is_dirty(&self.store)
     }
+}
+
+/// Where events being post-processed come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UpsertedFrom {
+    /// The server just served them with their bundled relations (a
+    /// back-pagination, a limited sync): what they bundle is the server's
+    /// word as of now, and so is what they don't.
+    ServerWithRelations,
+    /// A sync that isn't limited, which carries no bundled relations
+    /// (Synapse bundles them in `/sync` and sliding sync only with a limited
+    /// timeline): a summary it bundles is still the server's word, a missing
+    /// one says nothing.
+    LiveSync,
+    /// This cache had them already (redecryption).
+    Cache,
 }
 
 impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
@@ -580,6 +625,9 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         mut timeline: Timeline,
         read_receipt_event: &MaybeReceiptEventContent,
     ) -> Result<(bool, Vec<VectorDiff<Event>>), EventCacheError> {
+        // Only this sync's redactions are routed to their threads after it.
+        self.state.thread_roots_of_redacted_replies.clear();
+
         let mut prev_batch_token = timeline.prev_batch.take();
 
         let DeduplicationOutcome {
@@ -622,7 +670,12 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             // handle it for unread counts tracking.
             //
             // Post-process the ephemeral events.
-            self.post_process_upserted_events(empty(), read_receipt_event.as_ref()).await?;
+            self.post_process_upserted_events(
+                empty(),
+                read_receipt_event.as_ref(),
+                UpsertedFrom::LiveSync,
+            )
+            .await?;
 
             return Ok((false, Vec::new()));
         }
@@ -651,7 +704,16 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         self.propagate_changes().await?;
 
         // Post-process newly inserted events.
-        self.post_process_upserted_events(events.iter(), read_receipt_event.as_ref()).await?;
+        self.post_process_upserted_events(
+            events.iter(),
+            read_receipt_event.as_ref(),
+            if timeline.limited {
+                UpsertedFrom::ServerWithRelations
+            } else {
+                UpsertedFrom::LiveSync
+            },
+        )
+        .await?;
 
         if timeline.limited && has_new_gap {
             // If there was a previous batch token for a limited timeline,
@@ -677,6 +739,7 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
         &mut self,
         events: I,
         receipt_event: Option<&ReceiptEventContent>,
+        upserted_from: UpsertedFrom,
     ) -> Result<(), EventCacheError>
     where
         I: Iterator<Item = &'i Event>,
@@ -697,11 +760,88 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 redecryptor::try_decrypt_in_place(&mut bundled_thread, room.as_ref()).await;
                 self.save_events([bundled_thread]).await?;
             }
+
+            // Remember the summary the server bundled with a thread root, and
+            // forget it when the server serves a known root without one where
+            // it bundles relations: its thread has no reply left. Only there
+            // (not on the live sync path), and only for an event that relates
+            // to none (only such an event can be a root), is the store read.
+            if self.state.enabled_thread_support
+                && let Some(event_id) = event.event_id()
+            {
+                match BundledThreadSummary::from_root(event) {
+                    // Redecrypted events come from this cache, with what they
+                    // bundled when first received: stale, perhaps, and taken
+                    // into account then already.
+                    Some(_) if upserted_from == UpsertedFrom::Cache => {}
+                    Some(bundled_summary) => {
+                        self.update_stored_thread_info(event_id, true, |thread_info| {
+                            thread_info.remember_bundled_summary(bundled_summary)
+                        })
+                        .await;
+                    }
+                    None if upserted_from == UpsertedFrom::ServerWithRelations
+                        && extract_relation(event.raw()).is_none() =>
+                    {
+                        self.update_stored_thread_info(
+                            event_id,
+                            false,
+                            ThreadInfo::forget_bundled_summary,
+                        )
+                        .await;
+                    }
+                    None => {}
+                }
+            }
         }
 
         self.update_read_receipts(receipt_event).await?;
 
         Ok(())
+    }
+
+    /// Update the stored `ThreadInfo` of `thread_root` with `update`, which
+    /// returns whether it changed anything; with `create`, register the
+    /// thread if it isn't yet.
+    ///
+    /// This is how this cache keeps the summary the server bundles with a
+    /// thread root (`ThreadInfo::bundled_summary`): the bundled relations are
+    /// stripped from the events this cache stores, and the thread may know
+    /// none of its replies yet (an old thread on a new device). Without it,
+    /// after a restart or a reload from the store, the root would read the
+    /// zero replies counted on this device. A thread cache takes the stored
+    /// value over on its next write. See `ThreadInfo::summary` for how it is
+    /// used.
+    ///
+    /// A failure is logged, not returned: the root still shows the summary it
+    /// came with until then.
+    async fn update_stored_thread_info(
+        &mut self,
+        thread_root: &EventId,
+        create: bool,
+        update: impl FnOnce(&mut ThreadInfo) -> bool,
+    ) {
+        let room_id = &self.state.room_id;
+
+        let result = async {
+            // Creating the `ThreadInfo` registers the thread: it is one.
+            let Some(mut thread_info) =
+                self.store.load_thread_info(room_id, thread_root, create).await?
+            else {
+                return Ok(());
+            };
+
+            if !update(&mut thread_info) {
+                return Ok(());
+            }
+
+            self.store.update_thread_info(room_id, thread_root, &thread_info).await
+        }
+        .await;
+
+        if let Err(error) = result {
+            error!(?room_id, ?thread_root, ?error, "Failed to update a stored thread summary");
+        }
     }
 
     /// Update read receipts for all events in the room, based on the current
@@ -796,20 +936,44 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
             return Ok(());
         };
 
-        let target_event_raw = target_event.raw();
-
         // Don't redact already redacted events.
-        if let Ok(deserialized) = target_event_raw.deserialize()
+        if let Ok(deserialized) = target_event.raw().deserialize()
             && deserialized.is_redacted()
         {
             return Ok(());
         }
+
+        // The thread of a reply, read before the redaction: the redacted form
+        // loses its relation, and so a thread cache sees no reply of its own
+        // to take out of the bundled summary.
+        let thread_root = self
+            .state
+            .enabled_thread_support
+            .then(|| extract_thread_root(target_event.raw()))
+            .flatten();
+        let target_sent_at = target_event.timestamp();
+
+        let target_event_raw = target_event.raw();
 
         if let Some(redacted_event) = apply_redaction(
             target_event_raw,
             event.raw().cast_ref_unchecked::<SyncRoomRedactionEvent>(),
             &self.room_version_rules.redaction,
         ) {
+            // A redacted thread reply is no longer in its thread: take it out
+            // of the summary the server bundled with the root, if that counted
+            // it. Only once the redaction applies: one that can't leaves the
+            // reply in place.
+            if let Some(thread_root) = thread_root {
+                self.update_stored_thread_info(&thread_root, false, |thread_info| {
+                    thread_info.take_redacted_reply_out_of_bundled(&target_event_id, target_sent_at)
+                })
+                .await;
+                self.state
+                    .thread_roots_of_redacted_replies
+                    .insert(target_event_id.clone(), thread_root);
+            }
+
             // It's safe to cast `redacted_event` here:
             //
             // - either the event was an `AnyTimelineEvent` cast to
@@ -850,6 +1014,10 @@ impl<'a> StateLockWriteGuard<'a, RoomEventCacheState> {
                 // post-processing step, as the redecryption may have decrypted
                 // some events that don't count as unreads.
                 None,
+                // Redecrypted events come from this cache: from the store
+                // they come without bundled relations, which says nothing
+                // about their thread.
+                UpsertedFrom::Cache,
             )
             .await?;
 
